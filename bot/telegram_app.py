@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# Per-user focus pair (session only, not persisted)
+# ============================================================
+
+_focus_pairs: dict[int, str] = {}
+
+
+def _get_focus(chat_id: int) -> Optional[str]:
+    return _focus_pairs.get(chat_id)
+
+
+# ============================================================
 # Helpers
 # ============================================================
 
@@ -34,22 +45,6 @@ def _display_symbol(broker_symbol: str) -> str:
     return config.PAIRS_REVERSE.get(broker_symbol.upper(), broker_symbol.lower())
 
 
-def _user_tz(chat_id: int) -> str:
-    user = db.get_user(chat_id)
-    return user.timezone if user else "Etc/GMT-8"
-
-
-def _fmt_time(epoch_s: float, tz_name: str) -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(tz_name)
-        dt = datetime.fromtimestamp(epoch_s, tz=tz)
-        return dt.strftime("%H:%M")
-    except Exception:
-        dt = datetime.fromtimestamp(epoch_s, tz=timezone.utc)
-        return dt.strftime("%H:%M UTC")
-
-
 def _err(msg: str) -> str:
     return f"❌ {msg}"
 
@@ -58,25 +53,78 @@ def _err(msg: str) -> str:
 # Command handlers
 # ============================================================
 
+async def cmd_focus_pair(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or show the session focus pair. /fp [SYMBOL|off]"""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        current = _get_focus(chat_id)
+        if current:
+            display = _display_symbol(current)
+            await update.message.reply_text(f"🎯 Focus: {display.upper()}\n/fp off to clear")
+        else:
+            await update.message.reply_text(
+                "No focus pair set.\nUsage: /fp XAUUSD\n/fp off to clear"
+            )
+        return
+
+    arg = args[0].lower()
+    if arg in ("off", "clear", "none"):
+        _focus_pairs.pop(chat_id, None)
+        await update.message.reply_text("✅ Focus cleared")
+        return
+
+    resolved = await mt5_data.resolve_symbol(arg)
+    if resolved is None:
+        suggestions = await mt5_data.suggest_symbols(arg)
+        if suggestions:
+            s = ", ".join(suggestions[:10])
+            await update.message.reply_text(
+                f"❌ Symbol '{arg}' not found.\nDid you mean: {s}?"
+            )
+        else:
+            await update.message.reply_text(_err(f"Symbol '{arg}' not found"))
+        return
+
+    _focus_pairs[chat_id] = resolved
+    display = _display_symbol(resolved)
+    await update.message.reply_text(
+        f"🎯 Focus set to {display.upper()}\n"
+        f"/add 5  →  {display.upper()} M5 alert\n"
+        f"/p 2600  →  {display.upper()} price 2600\n"
+        f"/fp off to clear"
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>ta-bot</b> — trading alert bot\n\n"
-        "<b>Commands:</b>\n"
+        "<b>Session:</b>\n"
+        "/fp XAUUSD — set focus pair\n"
+        "/fp — show focus\n"
+        "/fp off — clear focus\n\n"
+        "<b>Candle alerts:</b>\n"
         "/add 5 — timer-only M5 alert\n"
         "/add XAUUSD 5 — M5 alert with OHLC\n"
         "/del — remove all candle alerts\n"
         "/del XAUUSD 5 — remove specific\n"
         "/list — show active alerts\n"
-        "/offset 8 — pre-close seconds\n"
+        "/offset 8 — pre-close seconds\n\n"
+        "<b>OHLC data:</b>\n"
         "/now XAUUSD 3 — live M3 OHLC\n"
-        "/level XAUUSD — yesterday OHLC\n"
+        "/level XAUUSD — yesterday OHLC\n\n"
+        "<b>Price alerts:</b>\n"
         "/price XAUUSD 2400 — cross alert\n"
         "/price XAUUSD above 2400 — directional\n"
         "/cancel p7 — remove price alert\n"
-        "/tz Asia/Jakarta — set timezone\n"
+        "/cancel — cancel all price alerts\n\n"
+        "<b>Other:</b>\n"
         "/status — bot health\n"
         "/help — this text\n\n"
-        "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4",
+        "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
+        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s\n"
+        "<b>Focus pair:</b> set /fp, then /a 5 = /a PAIR 5",
         parse_mode=ParseMode.HTML,
     )
 
@@ -91,6 +139,27 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if len(args) == 1:
+        focus = _get_focus(chat_id)
+        if focus:
+            # /add TIMEFRAME with focus pair → symbol + tf
+            tf = parse_tf(args[0])
+            if tf is None:
+                await update.message.reply_text(_err(f"Unknown timeframe: {args[0]}"))
+                return
+            resolved = focus
+            display = _display_symbol(resolved)
+            try:
+                alert = db.add_candle_alert(chat_id, symbol=resolved, timeframe_min=tf)
+                scheduler.subscriptions_changed.set()
+                await update.message.reply_text(
+                    f"✅ {display.upper()} {tf_label(tf)} alert\n"
+                    f"Pre-close offset: {db.get_user(chat_id).default_offset_s}s\n"
+                    f"/del {display} {tf} to remove"
+                )
+            except ValueError as e:
+                await update.message.reply_text(_err(str(e)))
+            return
+
         # /add TIMEFRAME — timer-only
         tf = parse_tf(args[0])
         if tf is None:
@@ -155,6 +224,20 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if len(args) == 1:
+        focus = _get_focus(chat_id)
+        if focus:
+            # /del TIMEFRAME with focus pair → delete focus+tf
+            tf = parse_tf(args[0])
+            if tf is not None:
+                n = db.delete_candle_alerts_by(chat_id, symbol=focus, timeframe_min=tf)
+                if n > 0:
+                    scheduler.subscriptions_changed.set()
+                    display = _display_symbol(focus)
+                    await update.message.reply_text(f"🗑️ Removed {n} {display.upper()} {tf_label(tf)} alert(s)")
+                else:
+                    await update.message.reply_text(f"No {_display_symbol(focus).upper()} {tf_label(tf)} alerts")
+                return
+
         # /del TIMEFRAME — remove timer-only alerts with that tf
         tf = parse_tf(args[0])
         if tf is not None:
@@ -163,58 +246,67 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 scheduler.subscriptions_changed.set()
                 await update.message.reply_text(f"🗑️ Removed {n} {tf_label(tf)} alert(s)")
             else:
-                await update.message.reply_text(f"No {tf_label(tf)} alerts to remove")
-            return
-        # /del SYMBOL — remove all alerts for that symbol
-        sym = args[0].lower()
-        n = db.delete_candle_alerts_by(chat_id, symbol=sym)
-        if n > 0:
-            scheduler.subscriptions_changed.set()
-            await update.message.reply_text(f"🗑️ Removed {n} alert(s) for {sym.upper()}")
+                await update.message.reply_text(f"No {tf_label(tf)} alerts")
         else:
-            await update.message.reply_text(f"No alerts for {sym.upper()}")
+            await update.message.reply_text(_err(f"Unknown timeframe: {args[0]} — use /del SYMBOL TIMEFRAME"))
         return
 
     # /del SYMBOL TIMEFRAME
-    sym = args[0].lower()
+    symbol = args[0].upper()
     tf = parse_tf(args[1])
     if tf is None:
         await update.message.reply_text(_err(f"Unknown timeframe: {args[1]}"))
         return
-    n = db.delete_candle_alerts_by(chat_id, symbol=sym, timeframe_min=tf)
+
+    resolved = await mt5_data.resolve_symbol(symbol)
+    if resolved is None:
+        await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
+        return
+
+    n = db.delete_candle_alerts_by(chat_id, symbol=resolved, timeframe_min=tf)
     if n > 0:
         scheduler.subscriptions_changed.set()
-        await update.message.reply_text(f"🗑️ Removed {sym.upper()} {tf_label(tf)} alert")
+        display = _display_symbol(resolved)
+        await update.message.reply_text(f"🗑️ Removed {n} {display.upper()} {tf_label(tf)} alert(s)")
     else:
-        await update.message.reply_text(f"No {sym.upper()} {tf_label(tf)} alert found")
+        await update.message.reply_text(f"No {_display_symbol(resolved).upper()} {tf_label(tf)} alerts")
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    candle_alerts = db.get_candle_alerts(chat_id)
+    candle_alerts = db.get_candle_alerts_for(chat_id)
     price_alerts = db.get_price_alerts(chat_id)
 
     if not candle_alerts and not price_alerts:
-        await update.message.reply_text("No active alerts.\n/add to create one.")
+        tz = db.get_user(chat_id).timezone
+        await update.message.reply_text(
+            f"No active alerts\n"
+            f"Offset: {db.get_user(chat_id).default_offset_s}s\n"
+            f"Timezone: {tz}"
+        )
         return
 
     lines = []
     if candle_alerts:
-        lines.append("<b>Candle Alerts:</b>")
+        lines.append("<b>Candle alerts:</b>")
         for a in candle_alerts:
             if a.symbol:
                 display = _display_symbol(a.symbol)
-                label = f"{display.upper()} {tf_label(a.timeframe_min)}"
+                lines.append(f"  {display.upper()} {tf_label(a.timeframe_min)}")
             else:
-                label = f"Timer {tf_label(a.timeframe_min)}"
-            offset = a.offset_s if a.offset_s is not None else db.get_user(chat_id).default_offset_s
-            lines.append(f"  c{a.id} {label}  offset={offset}s")
+                lines.append(f"  Timer-only {tf_label(a.timeframe_min)}")
+
     if price_alerts:
-        lines.append("<b>Price Alerts:</b>")
+        lines.append("")
+        lines.append("<b>Price alerts:</b>")
         for a in price_alerts:
             display = _display_symbol(a.symbol)
-            dir_str = f" {a.direction}" if a.direction else " cross"
+            dir_str = f" {a.direction}" if a.direction else ""
             lines.append(f"  p{a.user_seq} {display.upper()}{dir_str} {a.target}")
+
+    focus = _get_focus(chat_id)
+    if focus:
+        lines.append(f"\n🎯 Focus: {_display_symbol(focus).upper()}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -226,13 +318,17 @@ async def cmd_offset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not args:
         user = db.get_user(chat_id)
-        await update.message.reply_text(f"Offset: {user.default_offset_s}s\nUsage: /offset 8")
+        await update.message.reply_text(
+            f"Pre-close offset: {user.default_offset_s}s\n"
+            f"Usage: /offset SECONDS\n"
+            f"Example: /offset 8"
+        )
         return
 
     try:
         offset = int(args[0])
     except ValueError:
-        await update.message.reply_text(_err("Offset must be a number of seconds"))
+        await update.message.reply_text(_err(f"Invalid offset: {args[0]} — must be a number"))
         return
 
     if offset < 0 or offset > 60:
@@ -241,32 +337,44 @@ async def cmd_offset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     db.update_user(chat_id, default_offset_s=offset)
     scheduler.subscriptions_changed.set()
-    await update.message.reply_text(f"✅ Offset set to {offset}s")
+    await update.message.reply_text(f"✅ Pre-close offset set to {offset}s")
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     args = context.args or []
 
-    if len(args) < 2:
-        await update.message.reply_text(_err("Usage: /now SYMBOL TIMEFRAME\nExample: /now xauusd 3"))
+    if not args:
+        await update.message.reply_text(_err("Usage: /now [SYMBOL] TIMEFRAME\nExample: /now xauusd 3"))
         return
 
-    symbol = args[0].lower()
-    tf = parse_tf(args[1])
-    if tf is None:
-        await update.message.reply_text(_err(f"Unknown timeframe: {args[1]}"))
-        return
+    if len(args) == 1:
+        focus = _get_focus(chat_id)
+        if focus:
+            # /now TIMEFRAME with focus
+            tf = parse_tf(args[0])
+            if tf is None:
+                await update.message.reply_text(_err(f"Unknown timeframe: {args[0]}"))
+                return
+            resolved = focus
+        else:
+            await update.message.reply_text(_err("Usage: /now SYMBOL TIMEFRAME\nOr set focus with /fp first"))
+            return
+    else:
+        symbol = args[0].upper()
+        tf = parse_tf(args[1])
+        if tf is None:
+            await update.message.reply_text(_err(f"Unknown timeframe: {args[1]}"))
+            return
+        resolved = await mt5_data.resolve_symbol(symbol)
+        if resolved is None:
+            await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
+            return
 
-    resolved = await mt5_data.resolve_symbol(symbol)
-    if resolved is None:
-        await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
-        return
-
-    bar = await mt5_data.current_bar(resolved, tf)
-    prev = await mt5_data.previous_bar(resolved, tf)
     tick = await mt5_data.tick(resolved)
     sinfo = await mt5_data.symbol_info(resolved)
+    bar = await mt5_data.current_bar(resolved, tf)
+    prev = await mt5_data.previous_bar(resolved, tf)
 
     if bar is None:
         await update.message.reply_text(_err(f"No data for {_display_symbol(resolved)} {tf_label(tf)}"))
@@ -281,18 +389,21 @@ async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
 
     if not args:
-        await update.message.reply_text(_err("Usage: /level SYMBOL\nExample: /level xauusd"))
-        return
-
-    symbol = args[0].lower()
-    resolved = await mt5_data.resolve_symbol(symbol)
-    if resolved is None:
-        await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
-        return
+        focus = _get_focus(chat_id)
+        if focus:
+            resolved = focus
+        else:
+            await update.message.reply_text(_err("Usage: /level SYMBOL\nOr set focus with /fp first\nExample: /level xauusd"))
+            return
+    else:
+        symbol = args[0].lower()
+        resolved = await mt5_data.resolve_symbol(symbol)
+        if resolved is None:
+            await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
+            return
 
     yesterday = await mt5_data.previous_day_bar(resolved)
     today = await mt5_data.today_open_bar(resolved)
-    tz = _user_tz(chat_id)
     sinfo = await mt5_data.symbol_info(resolved)
     display = _display_symbol(resolved)
 
@@ -304,12 +415,12 @@ async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"  H {_fmt_ohlc(yesterday.high, resolved, sinfo)}")
         lines.append(f"  L {_fmt_ohlc(yesterday.low, resolved, sinfo)}")
         lines.append(f"  C {_fmt_ohlc(yesterday.close, resolved, sinfo)}")
-        dt = _fmt_time(yesterday.time, tz)
+        dt = datetime.fromtimestamp(yesterday.time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         lines.append(f"  ({dt})\n")
 
     if today:
         lines.append(f"<b>Today Open:</b> {_fmt_ohlc(today.open, resolved, sinfo)}")
-        dt = _fmt_time(today.time, tz)
+        dt = datetime.fromtimestamp(today.time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         lines.append(f"  ({dt})")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -320,50 +431,93 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.ensure_user(chat_id)
     args = context.args or []
 
-    if len(args) < 2:
+    if len(args) < 1:
         await update.message.reply_text(
-            _err("Usage: /price SYMBOL TARGET\n"
+            _err("Usage: /price [SYMBOL] TARGET [ABOVE/BELOW]\n"
                  "  /price xauusd 2400\n"
+                 "  /price 2400 (with focus pair)\n"
                  "  /price xauusd above 2400")
         )
         return
 
-    symbol = args[0].lower()
-    target = None
     direction = None
+    target = None
+    symbol = None
 
-    # Parse: /price SYMBOL TARGET  or  /price SYMBOL above/below TARGET
-    if len(args) == 2:
-        try:
-            target = float(args[1])
-        except ValueError:
-            await update.message.reply_text(_err(f"Invalid target: {args[1]}"))
+    if len(args) == 1:
+        # /price TARGET — needs focus pair
+        focus = _get_focus(chat_id)
+        if not focus:
+            await update.message.reply_text(
+                _err("Usage: /price [SYMBOL] TARGET\n"
+                     "Or set focus with /fp first, then /price 2600")
+            )
             return
-    elif len(args) >= 3:
-        if args[1] in ("above", "below"):
-            direction = args[1]
+        try:
+            target = float(args[0])
+        except ValueError:
+            await update.message.reply_text(_err(f"Invalid price target: {args[0]}"))
+            return
+        symbol = _display_symbol(focus)
+        resolved = focus
+
+    elif len(args) == 2:
+        if args[0].lower() in ("above", "below"):
+            # /price ABOVE/BELOW TARGET — needs focus pair
+            focus = _get_focus(chat_id)
+            if not focus:
+                await update.message.reply_text(
+                    _err("Usage: /price SYMBOL ABOVE TARGET\n"
+                         "Or set focus with /fp first, then /price above 2600")
+                )
+                return
+            direction = args[0].lower()
+            try:
+                target = float(args[1])
+            except ValueError:
+                await update.message.reply_text(_err(f"Invalid price target: {args[1]}"))
+                return
+            resolved = focus
+            symbol = _display_symbol(focus)
+        else:
+            # /price SYMBOL TARGET
+            try:
+                target = float(args[1])
+            except ValueError:
+                await update.message.reply_text(_err(f"Invalid price target: {args[1]}"))
+                return
+            symbol = args[0].upper()
+            resolved = await mt5_data.resolve_symbol(symbol)
+            if resolved is None:
+                await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
+                return
+
+    else:
+        # /price SYMBOL ABOVE/BELOW TARGET
+        symbol = args[0].upper()
+        if args[1].lower() in ("above", "below"):
+            direction = args[1].lower()
             try:
                 target = float(args[2])
             except ValueError:
-                await update.message.reply_text(_err(f"Invalid target: {args[2]}"))
+                await update.message.reply_text(_err(f"Invalid price target: {args[2]}"))
                 return
         else:
-            await update.message.reply_text(_err("Usage: /price SYMBOL [above|below] TARGET"))
+            await update.message.reply_text(_err("Usage: /price SYMBOL [ABOVE/BELOW] TARGET"))
+            return
+
+        resolved = await mt5_data.resolve_symbol(symbol)
+        if resolved is None:
+            await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
             return
 
     if target is None:
-        await update.message.reply_text(_err("Missing target"))
+        await update.message.reply_text(_err("Missing price target"))
         return
 
-    resolved = await mt5_data.resolve_symbol(symbol)
-    if resolved is None:
-        await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
-        return
-
-    # Check current price to set initial last_side
     tick = await mt5_data.tick(resolved)
     if tick is None:
-        await update.message.reply_text(_err(f"No tick data for {resolved}"))
+        await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
         return
 
     price = tick.bid
@@ -419,28 +573,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(_err("Use /cancel pID for price alerts\n/del for candle alerts"))
 
 
-async def cmd_tz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    db.ensure_user(chat_id)
-    args = context.args or []
-
-    if not args:
-        user = db.get_user(chat_id)
-        await update.message.reply_text(f"Timezone: {user.timezone}\nUsage: /tz Asia/Jakarta")
-        return
-
-    tz = args[0]
-    try:
-        from zoneinfo import ZoneInfo
-        ZoneInfo(tz)
-    except Exception:
-        await update.message.reply_text(_err(f"Invalid timezone: {tz}\nExample: /tz Asia/Jakarta"))
-        return
-
-    db.update_user(chat_id, timezone=tz)
-    await update.message.reply_text(f"✅ Timezone set to {tz}")
-
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     health = await mt5_data.health()
@@ -453,6 +585,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     candle_count = len(db.get_candle_alerts())
     price_count = len(db.get_price_alerts())
+    focus = _get_focus(chat_id)
 
     lines = [
         f"<b>MT5</b> — connected",
@@ -461,6 +594,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Active alerts: {candle_count} candle, {price_count} price",
         f"Bot time: {_now_utc()} UTC",
     ]
+    if focus:
+        lines.append(f"Focus pair: {_display_symbol(focus).upper()}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -620,6 +755,7 @@ def build_app() -> Application:
 
     # Register handlers (full names)
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("focus-pair", cmd_focus_pair))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("del", cmd_del))
     app.add_handler(CommandHandler("list", cmd_list))
@@ -628,10 +764,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("level", cmd_level))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("tz", cmd_tz))
     app.add_handler(CommandHandler("status", cmd_status))
 
     # Shorthand aliases
+    app.add_handler(CommandHandler("fp", cmd_focus_pair))
     app.add_handler(CommandHandler("a", cmd_add))
     app.add_handler(CommandHandler("d", cmd_del))
     app.add_handler(CommandHandler("l", cmd_list))
@@ -640,7 +776,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("lv", cmd_level))
     app.add_handler(CommandHandler("p", cmd_price))
     app.add_handler(CommandHandler("c", cmd_cancel))
-    app.add_handler(CommandHandler("t", cmd_tz))
     app.add_handler(CommandHandler("s", cmd_status))
 
     # Start scheduler in background

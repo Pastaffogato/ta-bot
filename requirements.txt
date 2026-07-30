@@ -1,4 +1,4 @@
 python-telegram-bot[job-queue]>=20.0,<22
 MetaTrader5>=5.0.45
-numpy<2
+numpy>=2.2
 pyyaml>=6.0

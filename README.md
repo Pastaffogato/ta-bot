@@ -85,6 +85,8 @@ nssm install ta-bot
 
 | Command | Shorthand | Example |
 |---------|-----------|---------|
+| `/fp` |  | `/fp XAUUSD` — set session focus pair |
+| `/fp` |  | `/fp off` — clear focus |
 | `/add` | `/a` | `/add 5` — timer-only M5 alert |
 | `/add` | `/a` | `/add XAUUSD 5` — M5 alert with OHLC |
 | `/del` | `/d` | `/del` — remove all candle alerts |
@@ -97,9 +99,23 @@ nssm install ta-bot
 | `/price` | `/p` | `/price XAUUSD above 2400` — directional |
 | `/cancel` | `/c` | `/cancel p7` — remove price alert by ID |
 | `/cancel` | `/c` | `/cancel` — remove ALL price alerts |
-| `/tz` | `/t` | `/tz Asia/Jakarta` — set timezone (default UTC+8) |
 | `/status` | `/s` | bot health, MT5 connection, active alerts |
 | `/help` | | command reference |
+
+### Focus pair
+
+Set a session focus pair with `/fp XAUUSD`. After that, commands accept shorter forms:
+
+| Without focus | With focus (XAUUSD) |
+|--------------|---------------------|
+| `/add XAUUSD 5` | `/add 5` |
+| `/del XAUUSD 5` | `/del 5` |
+| `/now XAUUSD 3` | `/now 3` |
+| `/level XAUUSD` | `/level` |
+| `/price XAUUSD 2600` | `/price 2600` |
+| `/price XAUUSD above 2600` | `/price above 2600` |
+
+Focus is session-only (not persisted). Clear with `/fp off`.
 
 ## Timeframes
 
