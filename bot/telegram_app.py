@@ -274,7 +274,7 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    candle_alerts = db.get_candle_alerts_for(chat_id)
+    candle_alerts = db.get_candle_alerts(chat_id)
     price_alerts = db.get_price_alerts(chat_id)
 
     if not candle_alerts and not price_alerts:
