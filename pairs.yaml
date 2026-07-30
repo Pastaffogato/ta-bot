@@ -1,0 +1,16 @@
+# Pair mapping: ideal name → broker MT5 symbol name
+# Edit this when switching brokers or VPS. The bot resolves
+# user input (e.g. "xauusd") to the broker symbol below.
+#
+# Format:
+#   ideal_name: broker_symbol
+#
+# Add your pairs here:
+
+xauusd: XAUUSD.pc
+xagusd: XAGUSD.pc
+btcusd: BTCUSD.sc
+us30: DJ30
+us100: NAS100
+nas100: NAS100
+dj30: DJ30
