@@ -755,7 +755,7 @@ def build_app() -> Application:
 
     # Register handlers (full names)
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("focus-pair", cmd_focus_pair))
+    app.add_handler(CommandHandler("focus_pair", cmd_focus_pair))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("del", cmd_del))
     app.add_handler(CommandHandler("list", cmd_list))
