@@ -547,17 +547,17 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
         pct_str = f" ({snap.atr_pct:.2f}%)" if snap.atr_pct else ""
         prev_str = ""
         if snap.atr_prev is not None:
-            prev_str += f" | Prev: {fmt_ohlc(snap.atr_prev, symbol, sinfo)}"
+            prev_str += f" - {fmt_ohlc(snap.atr_prev, symbol, sinfo)}"
         if snap.atr_prev2 is not None:
-            prev_str += f" | Prev2: {fmt_ohlc(snap.atr_prev2, symbol, sinfo)}"
-        parts.append(f"ATR(14): {atr_now}{pct_str}{prev_str}")
+            prev_str += f" - {fmt_ohlc(snap.atr_prev2, symbol, sinfo)}"
+        parts.append(f"ATR(14): {atr_now}{prev_str}{pct_str}")
 
     if snap.rsi is not None:
         rsi_str = f"{snap.rsi:.1f}"
         if snap.rsi_prev is not None:
-            rsi_str += f" | Prev: {snap.rsi_prev:.1f}"
+            rsi_str += f" - {snap.rsi_prev:.1f}"
         if snap.rsi_prev2 is not None:
-            rsi_str += f" | Prev2: {snap.rsi_prev2:.1f}"
+            rsi_str += f" - {snap.rsi_prev2:.1f}"
         zone = ""
         if snap.rsi > 70:
             zone = " (overbought)"
