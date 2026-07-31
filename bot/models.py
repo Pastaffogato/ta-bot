@@ -7,7 +7,7 @@ from typing import Optional
 class User:
     chat_id: int
     timezone: str = "Etc/GMT-8"
-    default_offset_s: int = 8
+    default_offset_s: int = 0
     created_at: str = ""
 
 
@@ -48,6 +48,7 @@ class CandleDelivery:
 class Mark:
     id: int = 0
     chat_id: int = 0
+    user_seq: int = 0  # per-user sequence number (1, 2, 3…)
     symbol: str = ""
     price: float = 0.0
     created_at: str = ""

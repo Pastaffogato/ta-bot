@@ -37,7 +37,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS users (
             chat_id    INTEGER PRIMARY KEY,
             timezone   TEXT NOT NULL DEFAULT 'Etc/GMT-8',
-            default_offset_s INTEGER NOT NULL DEFAULT 8,
+            default_offset_s INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
@@ -82,6 +82,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS marks (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id    INTEGER NOT NULL REFERENCES users(chat_id),
+            user_seq   INTEGER NOT NULL DEFAULT 0,
             symbol     TEXT NOT NULL,
             price      REAL NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -107,6 +108,24 @@ def init_db() -> None:
         conn.execute(
             "UPDATE price_alerts SET user_seq = ? WHERE id = ?",
             (counters[row["chat_id"]], row["id"]),
+        )
+    if rows:
+        conn.commit()
+
+    # Migration: add user_seq to marks + backfill
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(marks)").fetchall()]
+    if "user_seq" not in cols:
+        conn.execute("ALTER TABLE marks ADD COLUMN user_seq INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    rows = conn.execute(
+        "SELECT id, chat_id FROM marks WHERE user_seq = 0 ORDER BY id"
+    ).fetchall()
+    counters2: dict[int, int] = defaultdict(int)
+    for row in rows:
+        counters2[row["chat_id"]] += 1
+        conn.execute(
+            "UPDATE marks SET user_seq = ? WHERE id = ?",
+            (counters2[row["chat_id"]], row["id"]),
         )
     if rows:
         conn.commit()
@@ -299,9 +318,20 @@ def set_user_pref(chat_id: int, key: str, value: str) -> None:
 
 def add_mark(chat_id: int, symbol: str, price: float, expires_at: Optional[str] = None) -> Mark:
     with _tx() as conn:
+        # Find smallest unused user_seq for this chat_id
+        used = {
+            r[0] for r in conn.execute(
+                "SELECT user_seq FROM marks WHERE chat_id = ? AND user_seq > 0"
+                " AND (expires_at IS NULL OR expires_at > datetime('now'))",
+                (chat_id,),
+            ).fetchall()
+        }
+        user_seq = 1
+        while user_seq in used:
+            user_seq += 1
         cur = conn.execute(
-            "INSERT INTO marks (chat_id, symbol, price, expires_at) VALUES (?, ?, ?, ?)",
-            (chat_id, symbol, price, expires_at),
+            "INSERT INTO marks (chat_id, user_seq, symbol, price, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, user_seq, symbol, price, expires_at),
         )
         row = conn.execute("SELECT * FROM marks WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _row_to_mark(row)
@@ -312,23 +342,41 @@ def get_marks(chat_id: int, symbol: Optional[str] = None) -> list[Mark]:
         rows = _conn().execute(
             "SELECT * FROM marks WHERE chat_id = ? AND symbol = ?"
             " AND (expires_at IS NULL OR expires_at > datetime('now'))"
-            " ORDER BY id",
+            " ORDER BY user_seq",
             (chat_id, symbol),
         ).fetchall()
     else:
         rows = _conn().execute(
             "SELECT * FROM marks WHERE chat_id = ?"
             " AND (expires_at IS NULL OR expires_at > datetime('now'))"
-            " ORDER BY id",
+            " ORDER BY user_seq",
             (chat_id,),
         ).fetchall()
     return [_row_to_mark(r) for r in rows]
 
 
-def delete_mark(mark_id: int, chat_id: int) -> bool:
+def delete_mark(chat_id: int, user_seq: int) -> bool:
     with _tx() as conn:
-        cur = conn.execute("DELETE FROM marks WHERE id = ? AND chat_id = ?", (mark_id, chat_id))
+        cur = conn.execute(
+            "DELETE FROM marks WHERE chat_id = ? AND user_seq = ?",
+            (chat_id, user_seq),
+        )
         return cur.rowcount > 0
+
+
+def delete_all_marks(chat_id: int) -> int:
+    with _tx() as conn:
+        cur = conn.execute("DELETE FROM marks WHERE chat_id = ?", (chat_id,))
+        return cur.rowcount
+
+
+def get_mark_by_user_seq(chat_id: int, user_seq: int) -> Optional[Mark]:
+    row = _conn().execute(
+        "SELECT * FROM marks WHERE chat_id = ? AND user_seq = ?"
+        " AND (expires_at IS NULL OR expires_at > datetime('now'))",
+        (chat_id, user_seq),
+    ).fetchone()
+    return _row_to_mark(row) if row else None
 
 
 # ---- row converters ----
@@ -373,6 +421,7 @@ def _row_to_mark(row: sqlite3.Row) -> Mark:
     return Mark(
         id=row["id"],
         chat_id=row["chat_id"],
+        user_seq=row["user_seq"],
         symbol=row["symbol"],
         price=row["price"],
         created_at=row["created_at"],

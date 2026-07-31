@@ -175,20 +175,17 @@ async def _send_group(
         bar = await mt5_data.current_bar(symbol, tf_min)        # position 0
         prev_bar = await mt5_data.previous_bar(symbol, tf_min)  # position 1
 
-        if offset == 0:
-            # We want the candle that just closed at close_epoch.
-            # bar.time is MT5 server time, candle_open_epoch is UTC.
-            # Use tick time to compute the server→UTC offset, then compare
-            # in server time.
-            tick = await mt5_data.tick(symbol)
-            server_offset = round(tick.time - time.time()) if tick else 0
-            expected_open_server = int(candle_open_epoch) + server_offset
-            if bar is None or abs(bar.time - expected_open_server) > 2:
-                # New bar already exists (or no bar) — use previous_bar
-                bar = prev_bar
-                prev_bar = await mt5_data.bar_at_offset(symbol, tf_min, 2)
-        else:
-            tick = await mt5_data.tick(symbol)
+        # We want the candle that just closed at close_epoch.
+        # bar.time is MT5 server time, candle_open_epoch is UTC.
+        # Use tick time to compute the server→UTC offset, then compare
+        # in server time.
+        tick = await mt5_data.tick(symbol)
+        server_offset = round(tick.time - time.time()) if tick else 0
+        expected_open_server = int(candle_open_epoch) + server_offset
+        if bar is None or abs(bar.time - expected_open_server) > 2:
+            # New bar already exists (or no bar) — use previous_bar
+            bar = prev_bar
+            prev_bar = await mt5_data.bar_at_offset(symbol, tf_min, 2)
 
         if tick is None:
             tick = await mt5_data.tick(symbol)  # retry once if needed

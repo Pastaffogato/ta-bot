@@ -135,38 +135,42 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
 
     if not args:
-        await update.message.reply_text(_err("Usage: /add [SYMBOL] TIMEFRAME\nExample: /add 5  or  /add XAUUSD 5"))
+        await update.message.reply_text(_err("Usage: /add [SYMBOL] TIMEFRAME [TIMEFRAME ...]\nExample: /add 5  or  /add XAUUSD 5"))
         return
 
-    if len(args) == 1:
-        focus = _get_focus(chat_id)
-        if focus:
-            # /add TIMEFRAME with focus pair → symbol + tf
-            tf = parse_tf(args[0])
+    focus = _get_focus(chat_id)
+
+    # Multi-arg with focus pair: /add 5 15 30
+    if focus and len(args) >= 1:
+        tfs = []
+        for a in args:
+            tf = parse_tf(a)
             if tf is None:
-                await update.message.reply_text(_err(f"Unknown timeframe: {args[0]}"))
-                return
-            resolved = focus
-            display = _display_symbol(resolved)
-            try:
-                alert = db.add_candle_alert(chat_id, symbol=resolved, timeframe_min=tf)
-                scheduler.subscriptions_changed.set()
-                await update.message.reply_text(
-                    f"✅ {display.upper()} {tf_label(tf)} alert\n"
-                    f"Pre-close offset: {db.get_user(chat_id).default_offset_s}s\n"
-                    f"/del {display} {tf} to remove"
-                )
-            except ValueError as e:
-                await update.message.reply_text(_err(str(e)))
+                tfs = None
+                break
+            tfs.append(tf)
+        if tfs:
+            display = _display_symbol(focus)
+            lines = []
+            for tf in tfs:
+                try:
+                    db.add_candle_alert(chat_id, symbol=focus, timeframe_min=tf)
+                    lines.append(f"✅ {display.upper()} {tf_label(tf)}")
+                except ValueError as e:
+                    lines.append(_err(str(e)))
+            scheduler.subscriptions_changed.set()
+            lines.append(f"Pre-close offset: {db.get_user(chat_id).default_offset_s}s")
+            await update.message.reply_text("\n".join(lines))
             return
 
-        # /add TIMEFRAME — timer-only
+    if len(args) == 1:
+        # /add TIMEFRAME — timer-only (no focus pair)
         tf = parse_tf(args[0])
         if tf is None:
             await update.message.reply_text(_err(f"Unknown timeframe: {args[0]}"))
             return
         try:
-            alert = db.add_candle_alert(chat_id, symbol=None, timeframe_min=tf)
+            db.add_candle_alert(chat_id, symbol=None, timeframe_min=tf)
             scheduler.subscriptions_changed.set()
             await update.message.reply_text(
                 f"✅ Timer-only {tf_label(tf)} alert\n"
@@ -197,7 +201,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         try:
-            alert = db.add_candle_alert(chat_id, symbol=resolved, timeframe_min=tf)
+            db.add_candle_alert(chat_id, symbol=resolved, timeframe_min=tf)
             scheduler.subscriptions_changed.set()
             display = _display_symbol(resolved)
             await update.message.reply_text(
@@ -223,22 +227,32 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("No candle alerts to remove")
         return
 
-    if len(args) == 1:
-        focus = _get_focus(chat_id)
-        if focus:
-            # /del TIMEFRAME with focus pair → delete focus+tf
-            tf = parse_tf(args[0])
-            if tf is not None:
-                n = db.delete_candle_alerts_by(chat_id, symbol=focus, timeframe_min=tf)
-                if n > 0:
-                    scheduler.subscriptions_changed.set()
-                    display = _display_symbol(focus)
-                    await update.message.reply_text(f"🗑️ Removed {n} {display.upper()} {tf_label(tf)} alert(s)")
-                else:
-                    await update.message.reply_text(f"No {_display_symbol(focus).upper()} {tf_label(tf)} alerts")
-                return
+    focus = _get_focus(chat_id)
 
-        # /del TIMEFRAME — remove timer-only alerts with that tf
+    # Multi-arg with focus pair: /del 5 15 30
+    if focus and len(args) >= 1:
+        tfs = []
+        for a in args:
+            tf = parse_tf(a)
+            if tf is None:
+                tfs = None
+                break
+            tfs.append(tf)
+        if tfs:
+            display = _display_symbol(focus)
+            total = 0
+            for tf in tfs:
+                n = db.delete_candle_alerts_by(chat_id, symbol=focus, timeframe_min=tf)
+                total += n
+            if total > 0:
+                scheduler.subscriptions_changed.set()
+                await update.message.reply_text(f"🗑️ Removed {total} {display.upper()} alert(s)")
+            else:
+                await update.message.reply_text(f"No {display.upper()} alerts to remove")
+            return
+
+    if len(args) == 1:
+        # /del TIMEFRAME — remove timer-only alerts with that tf (no focus pair)
         tf = parse_tf(args[0])
         if tf is not None:
             n = db.delete_candle_alerts_by(chat_id, timeframe_min=tf)
@@ -345,13 +359,17 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
 
     if not args:
-        await update.message.reply_text(_err("Usage: /now [SYMBOL] TIMEFRAME\nExample: /now xauusd 3"))
-        return
+        # /now with no args: if fp is active, default to M1
+        focus = _get_focus(chat_id)
+        if focus:
+            args = ["1"]
+        else:
+            await update.message.reply_text(_err("Usage: /now [SYMBOL] TIMEFRAME\nExample: /now xauusd 3\nOr set focus with /fp first, then /now 5"))
+            return
 
     if len(args) == 1:
         focus = _get_focus(chat_id)
         if focus:
-            # /now TIMEFRAME with focus
             tf = parse_tf(args[0])
             if tf is None:
                 await update.message.reply_text(_err(f"Unknown timeframe: {args[0]}"))
@@ -373,8 +391,9 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     tick = await mt5_data.tick(resolved)
     sinfo = await mt5_data.symbol_info(resolved)
-    bar = await mt5_data.current_bar(resolved, tf)
-    prev = await mt5_data.previous_bar(resolved, tf)
+    # Use the last completed bar (position 1), not the current incomplete bar
+    bar = await mt5_data.previous_bar(resolved, tf)
+    prev = await mt5_data.bar_at_offset(resolved, tf, 2)
 
     if bar is None:
         await update.message.reply_text(_err(f"No data for {_display_symbol(resolved)} {tf_label(tf)}"))
@@ -433,20 +452,45 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if len(args) < 1:
         await update.message.reply_text(
-            _err("Usage: /price [SYMBOL] TARGET [ABOVE/BELOW]\n"
+            _err("Usage: /price [SYMBOL] TARGET [ABOVE/BELOW] [TARGET ...]\n"
                  "  /price xauusd 2400\n"
                  "  /price 2400 (with focus pair)\n"
+                 "  /price 2400 2450 2500 (multi with focus pair)\n"
                  "  /price xauusd above 2400")
         )
         return
+
+    focus = _get_focus(chat_id)
+
+    # Multi-arg with focus pair: /price 2400 2450 2500
+    if focus and len(args) >= 1:
+        try:
+            targets = [float(a) for a in args]
+        except ValueError:
+            targets = None
+        if targets:
+            tick = await mt5_data.tick(focus)
+            if tick is None:
+                await update.message.reply_text(_err(f"No tick data for {_display_symbol(focus)}"))
+                return
+            display = _display_symbol(focus)
+            lines = []
+            for target in targets:
+                price = tick.bid
+                current_side = "above" if price > target else "below"
+                alert = db.add_price_alert(chat_id, focus, target, None)
+                db.update_price_alert(alert.id, last_side=current_side)
+                lines.append(f"p{alert.user_seq} {display.upper()} crossing {target}")
+            lines.append(f"Current bid: {_fmt_ohlc(tick.bid, focus, None)}")
+            await update.message.reply_text("\n".join(["✅ Price alerts:"] + lines))
+            return
 
     direction = None
     target = None
     symbol = None
 
     if len(args) == 1:
-        # /price TARGET — needs focus pair
-        focus = _get_focus(chat_id)
+        # /price TARGET — needs focus pair (multi-arg block handles the focus case)
         if not focus:
             await update.message.reply_text(
                 _err("Usage: /price [SYMBOL] TARGET\n"
@@ -464,7 +508,6 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif len(args) == 2:
         if args[0].lower() in ("above", "below"):
             # /price ABOVE/BELOW TARGET — needs focus pair
-            focus = _get_focus(chat_id)
             if not focus:
                 await update.message.reply_text(
                     _err("Usage: /price SYMBOL ABOVE TARGET\n"
@@ -599,6 +642,43 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def cmd_mark_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shorthand for /mark del [id]."""
+    context.args = ["del"] + (context.args or [])
+    await cmd_mark(update, context)
+
+
+async def cmd_mark_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shorthand for /mark list [symbol]."""
+    context.args = ["list"] + (context.args or [])
+    await cmd_mark(update, context)
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear all alerts and marks for this user."""
+    chat_id = update.effective_chat.id
+
+    n_candle = db.delete_candle_alerts_by(chat_id)
+    n_price = 0
+    for a in db.get_price_alerts(chat_id):
+        db.update_price_alert(a.id, enabled=False)
+        n_price += 1
+    n_mark = db.delete_all_marks(chat_id)
+
+    if n_candle > 0:
+        scheduler.subscriptions_changed.set()
+
+    parts = []
+    if n_candle: parts.append(f"{n_candle} candle")
+    if n_price: parts.append(f"{n_price} price")
+    if n_mark: parts.append(f"{n_mark} mark")
+
+    if parts:
+        await update.message.reply_text(f"🧹 Cleared: {', '.join(parts)}")
+    else:
+        await update.message.reply_text("Nothing to clear")
+
+
 async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Toggle which data sections appear in candle alerts."""
     chat_id = update.effective_chat.id
@@ -619,21 +699,27 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines))
         return
 
-    if len(args) >= 2:
-        action = args[0].lower()
-        key = args[1].lower()
-        if key not in VALID_PREFS:
-            await update.message.reply_text(
-                _err(f"Unknown section: {key}\nOptions: {', '.join(sorted(VALID_PREFS))}")
-            )
-            return
-        if action not in ("on", "off"):
-            await update.message.reply_text(_err("Use: /data on|off <section>"))
-            return
+    if len(args) < 2:
+        await update.message.reply_text(_err("Use: /data on|off <section> [section ...]\n  /data off show_bid_ask show_range"))
+        return
+
+    action = args[0].lower()
+    if action not in ("on", "off"):
+        await update.message.reply_text(_err("Use: /data on|off <section> [section ...]"))
+        return
+
+    keys = [a.lower() for a in args[1:]]
+    invalid = [k for k in keys if k not in VALID_PREFS]
+    if invalid:
+        await update.message.reply_text(
+            _err(f"Unknown section(s): {', '.join(invalid)}\nOptions: {', '.join(sorted(VALID_PREFS))}")
+        )
+        return
+
+    for key in keys:
         db.set_user_pref(chat_id, key, action)
-        await update.message.reply_text(f"✅ {key} = {action}")
-    else:
-        await update.message.reply_text(_err("Use: /data on|off <section>  or  /data list"))
+    plural = "s" if len(keys) > 1 else ""
+    await update.message.reply_text(f"✅ {', '.join(keys)} = {action}")
 
 
 async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -646,24 +732,29 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(_err(
             "Usage:\n"
             "/mark <symbol> <price> [expire_min]\n"
-            "/mark del <id>\n"
+            "/mark del [id] — delete all or specific\n"
             "/mark list [symbol]"
         ))
         return
 
     if args[0].lower() == "del":
         if len(args) < 2:
-            await update.message.reply_text(_err("Usage: /mark del <id>"))
+            # /mark del — delete all marks
+            n = db.delete_all_marks(chat_id)
+            if n > 0:
+                await update.message.reply_text(f"🗑️ Deleted {n} mark(s)")
+            else:
+                await update.message.reply_text("No marks to delete")
             return
         try:
-            mark_id = int(args[1])
+            user_seq = int(args[1])
         except ValueError:
             await update.message.reply_text(_err(f"Invalid mark ID: {args[1]}"))
             return
-        if db.delete_mark(mark_id, chat_id):
-            await update.message.reply_text(f"🗑️ Mark {mark_id} deleted")
+        if db.delete_mark(chat_id, user_seq):
+            await update.message.reply_text(f"🗑️ Mark M{user_seq} deleted")
         else:
-            await update.message.reply_text(_err(f"Mark {mark_id} not found"))
+            await update.message.reply_text(_err(f"Mark M{user_seq} not found"))
         return
 
     if args[0].lower() == "list":
@@ -674,6 +765,8 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(_err(f"Symbol not found: {symbol}"))
                 return
             symbol = resolved
+        elif not symbol:
+            symbol = _get_focus(chat_id)
         marks = db.get_marks(chat_id, symbol)
         if not marks:
             await update.message.reply_text("No active marks")
@@ -682,40 +775,50 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for m in marks:
             display = _display_symbol(m.symbol)
             exp = f" (expires {m.expires_at[:16]})" if m.expires_at else ""
-            lines.append(f"M{m.id}: {display.upper()} {_fmt_price(m.price, m.symbol)}{exp}")
+            lines.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(m.price, m.symbol)}{exp}")
         await update.message.reply_text("\n".join(lines))
         return
 
-    # Add mark: /mark <symbol> <price> [expire_min]
-    symbol = args[0]
-    resolved = await mt5_data.resolve_symbol(symbol)
-    if resolved is None:
-        await update.message.reply_text(_err(f"Symbol not found: {symbol}"))
-        return
-    symbol = resolved
-
+    # Add mark: /mark [SYMBOL] <price> [expire_min]
     try:
-        price = float(args[1])
-    except (IndexError, ValueError):
-        await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]"))
-        return
+        price = float(args[0])
+        focus = _get_focus(chat_id)
+        if not focus:
+            await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]\nOr set focus with /fp first, then /mark 2400.50"))
+            return
+        resolved = focus
+        symbol = focus
+        price_idx = 0
+    except ValueError:
+        symbol = args[0]
+        resolved = await mt5_data.resolve_symbol(symbol)
+        if resolved is None:
+            await update.message.reply_text(_err(f"Symbol not found: {symbol}"))
+            return
+        symbol = resolved
+        try:
+            price = float(args[1])
+        except (IndexError, ValueError):
+            await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]"))
+            return
+        price_idx = 1
 
     expires_at = None
-    if len(args) >= 3:
+    if len(args) > price_idx + 1:
         try:
-            expire_min = int(args[2])
+            expire_min = int(args[price_idx + 1])
             if expire_min > 0:
                 from datetime import timedelta
                 expires_at = (datetime.now(timezone.utc) + timedelta(minutes=expire_min)).isoformat()
         except ValueError:
-            await update.message.reply_text(_err(f"Invalid expiration: {args[2]}"))
+            await update.message.reply_text(_err(f"Invalid expiration: {args[price_idx + 1]}"))
             return
 
     mark = db.add_mark(chat_id, symbol, price, expires_at)
     display = _display_symbol(symbol)
-    exp_str = f" (expires in {args[2]}min)" if len(args) >= 3 else ""
+    exp_str = f" (expires in {args[price_idx + 1]}min)" if len(args) > price_idx + 1 else ""
     await update.message.reply_text(
-        f"📍 M{mark.id}: {display.upper()} {_fmt_price(price, symbol)}{exp_str}"
+        f"📍 M{mark.user_seq}: {display.upper()} {_fmt_price(price, symbol)}{exp_str}"
     )
 
 
@@ -778,7 +881,7 @@ def _format_candle_message(
                 f"BW {_fmt_ohlc(bw, symbol, sinfo)}"
             )
 
-    if tick and prefs.get("show_bid_ask", "on") != "off":
+    if tick and prefs.get("show_bid_ask", "off") != "off":
         spread = tick.spread
         lines.append(
             f"Bid {_fmt_ohlc(tick.bid, symbol, sinfo)}  "
@@ -794,7 +897,7 @@ def _format_candle_message(
             for m in marks:
                 dist_pips = (tick.bid - m.price) / pip_size
                 sign = "+" if dist_pips >= 0 else ""
-                lines.append(f"📍 M{m.id} {_fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
+                lines.append(f"📍 M{m.user_seq} {_fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
 
     return "\n".join(lines)
 
@@ -951,6 +1054,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("dt", cmd_data))
     app.add_handler(CommandHandler("mark", cmd_mark))
     app.add_handler(CommandHandler("mk", cmd_mark))
+    app.add_handler(CommandHandler("mkd", cmd_mark_del))
+    app.add_handler(CommandHandler("mkl", cmd_mark_list))
+    app.add_handler(CommandHandler("clear", cmd_clear))
 
     # Populate dot-prefix dispatch table
     _COMMANDS.update({
@@ -967,6 +1073,8 @@ def build_app() -> Application:
         "status": cmd_status, "s": cmd_status,
         "data": cmd_data, "dt": cmd_data,
         "mark": cmd_mark, "mk": cmd_mark,
+        "mkd": cmd_mark_del, "mkl": cmd_mark_list,
+        "clear": cmd_clear,
     })
 
     # Dot-prefix MessageHandler (e.g. ".add xauusd 5")
