@@ -482,7 +482,8 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
         bb_mid = fmt_ohlc(snap.bb_middle, symbol, sinfo)
         bb_low = fmt_ohlc(snap.bb_lower, symbol, sinfo)
         bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
-        lines.append(f"BB {bb_high} / {bb_mid} / {bb_low} ({bb_width_pips:.1f}p)")
+        bb_pct = snap.bb_width_pct if snap.bb_width_pct else 0
+        lines.append(f"BB {bb_high}-{bb_mid}-{bb_low} {bb_width_pips:.1f}p-{bb_pct:.1f}%")
 
     # Line 2: SMA50 + EMA20
     parts2 = []
@@ -500,7 +501,7 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
             atr_vals.append(snap.atr_prev)
         if snap.atr_prev2 is not None:
             atr_vals.append(snap.atr_prev2)
-        atr_str = " - ".join(fmt_ohlc(v, symbol, sinfo) if sinfo else f"{v:.5f}" for v in atr_vals)
+        atr_str = "-".join(fmt_ohlc(v, symbol, sinfo) if sinfo else f"{v:.5f}" for v in atr_vals)
         # compressing / expanding: compare latest ATR vs previous ATR
         note = ""
         if snap.atr_prev is not None:
@@ -519,7 +520,7 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
             rsi_vals.append(f"{snap.rsi_prev:.1f}")
         if snap.rsi_prev2 is not None:
             rsi_vals.append(f"{snap.rsi_prev2:.1f}")
-        rsi_str = " - ".join(rsi_vals)
+        rsi_str = "-".join(rsi_vals)
         zone = ""
         if snap.rsi > 70:
             zone = " OB"

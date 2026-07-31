@@ -186,8 +186,10 @@ async def _send_group(
         tick = await mt5_data.tick(symbol)
         server_offset = round(tick.time - time.time()) if tick else 0
         expected_open_server = int(candle_open_epoch) + server_offset
+        new_bar_appeared = False
         if bar is None or abs(bar.time - expected_open_server) > 2:
             # New bar already exists (or no bar) — use previous_bar
+            new_bar_appeared = True
             bar = prev_bar
             prev_bar = await mt5_data.bar_at_offset(symbol, tf_min, 2)
 
@@ -196,12 +198,15 @@ async def _send_group(
 
         sinfo = await mt5_data.symbol_info(symbol)
 
-        # ── indicator computation (fetch 500 bars, skip current for completed candle) ──
+        # ── indicator computation ──
+        # skip_current drops position-0 (the incomplete bar) ONLY when a new
+        # bar has already appeared. At offset=0 with no new bar yet, position-0
+        # IS the just-closed candle and must NOT be skipped.
         ind_snap = None
         try:
             bars = await mt5_data.bars_n(symbol, tf_min, 500)  # uses 500, since RSI and EMA uses a lot of candle despite the low period number
             if bars:
-                ind_snap = indicators.compute_all(bars, skip_current=True)
+                ind_snap = indicators.compute_all(bars, skip_current=new_bar_appeared)
         except Exception:
             logger.debug("Indicator fetch failed for %s %s", symbol, tf_label(tf_min))
     else:

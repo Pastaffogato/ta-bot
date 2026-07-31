@@ -419,15 +419,25 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     tick = await mt5_data.tick(resolved)
     sinfo = await mt5_data.symbol_info(resolved)
-    # Use the last completed bar (position 1), not the current incomplete bar
-    bar = await mt5_data.previous_bar(resolved, tf)
-    prev = await mt5_data.bar_at_offset(resolved, tf, 2)
+    # Use the current running candle (position 0), not the previous completed bar
+    bar = await mt5_data.current_bar(resolved, tf)
+    prev = await mt5_data.previous_bar(resolved, tf)
 
     if bar is None:
         await update.message.reply_text(_err(f"No data for {_display_symbol(resolved)} {tf_label(tf)}"))
         return
 
-    text = _format_candle_message(resolved, tf, bar, prev, tick, sinfo, bar.time + tf * 60, time.time(), chat_id)
+    # Compute indicators on the current running candle
+    ind_snap = None
+    try:
+        bars = await mt5_data.bars_n(resolved, tf, 500)
+        if bars:
+            from bot.indicators import compute_all
+            ind_snap = compute_all(bars, skip_current=False)
+    except Exception:
+        pass
+
+    text = _format_candle_message(resolved, tf, bar, prev, tick, sinfo, bar.time + tf * 60, time.time(), chat_id, ind_snap=ind_snap)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -1126,7 +1136,7 @@ async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     from bot.indicators import compute_all, format_indicator_full
 
-    snap = compute_all(bars, skip_current=True)
+    snap = compute_all(bars, skip_current=False)  # current running candle
     display = _display_symbol(symbol)
     header = f"{display.upper()} {tf_label(tf_min)}  Bid: {_fmt_ohlc(tick.bid, symbol, sinfo)}"
     report = format_indicator_full(snap, symbol, sinfo)
