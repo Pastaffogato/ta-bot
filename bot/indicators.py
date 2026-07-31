@@ -454,11 +454,14 @@ def _adx(
 def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs: dict = None) -> str:
     """Build a compact indicator display section for candle alerts.
 
-    Two lines:
-    Line 1: ATR(14) with last 3 values + SMA50 + BB (high, mid, low) + width in pips
-    Line 2: EMA20 + RSI(14) with last 3 values + ADX(14) with +DI/-DI
+    Five lines (each respecting granular prefs; empty lines are skipped):
+    Line 1: BB(20,2) high / mid / low + width in pips
+    Line 2: SMA50 + EMA20
+    Line 3: ATR(14) last 3 values ('-' separated) + compressing/expanding note
+    Line 4: RSI(14) last 3 values ('-' separated) + OB/OS zone
+    Line 5: ADX(14) with +DI/-DI + strength
 
-    Respects granular prefs: show_sma, show_ema, show_bb, show_atr, show_rsi, show_adx.
+    Granular prefs: show_sma, show_ema, show_bb, show_atr, show_rsi, show_adx.
     When a granular pref is "off", that indicator is hidden (along with its line if empty).
     show_indicators=off skips everything.
     """
@@ -473,59 +476,68 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
     def _on(key):
         return prefs.get(key, "on") != "off"
 
-    # Line 1: ATR + SMA50 + BB
-    parts1 = []
+    # Line 1: BB(20,2)
+    if _on("show_bb") and snap.bb_upper is not None:
+        bb_high = fmt_ohlc(snap.bb_upper, symbol, sinfo)
+        bb_mid = fmt_ohlc(snap.bb_middle, symbol, sinfo)
+        bb_low = fmt_ohlc(snap.bb_lower, symbol, sinfo)
+        bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
+        lines.append(f"BB {bb_high} / {bb_mid} / {bb_low} ({bb_width_pips:.1f}p)")
+
+    # Line 2: SMA50 + EMA20
+    parts2 = []
+    if _on("show_sma") and snap.sma50 is not None:
+        parts2.append(f"SMA50 {fmt_ohlc(snap.sma50, symbol, sinfo)}")
+    if _on("show_ema") and snap.ema20 is not None:
+        parts2.append(f"EMA20 {fmt_ohlc(snap.ema20, symbol, sinfo)}")
+    if parts2:
+        lines.append("  ".join(parts2))
+
+    # Line 3: ATR(14) — last 3 values separated by '-' + compression note
     if _on("show_atr") and snap.atr is not None:
         atr_vals = [snap.atr]
         if snap.atr_prev is not None:
             atr_vals.append(snap.atr_prev)
         if snap.atr_prev2 is not None:
             atr_vals.append(snap.atr_prev2)
-        atr_str = " ".join(fmt_ohlc(v, symbol, sinfo) if sinfo else f"{v:.5f}" for v in atr_vals)
-        parts1.append(f"ATR {atr_str}")
+        atr_str = " - ".join(fmt_ohlc(v, symbol, sinfo) if sinfo else f"{v:.5f}" for v in atr_vals)
+        # compressing / expanding: compare latest ATR vs previous ATR
+        note = ""
+        if snap.atr_prev is not None:
+            if snap.atr > snap.atr_prev:
+                note = " expanding"
+            elif snap.atr < snap.atr_prev:
+                note = " compressing"
+            else:
+                note = " flat"
+        lines.append(f"ATR {atr_str}{note}")
 
-    if _on("show_sma") and snap.sma50 is not None:
-        parts1.append(f"SMA50 {fmt_ohlc(snap.sma50, symbol, sinfo)}")
-
-    if _on("show_bb") and snap.bb_upper is not None:
-        bb_high = fmt_ohlc(snap.bb_upper, symbol, sinfo)
-        bb_mid = fmt_ohlc(snap.bb_middle, symbol, sinfo)
-        bb_low = fmt_ohlc(snap.bb_lower, symbol, sinfo)
-        bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
-        parts1.append(f"BB {bb_high} {bb_mid} {bb_low} ({bb_width_pips:.1f}p)")
-
-    if parts1:
-        lines.append("  ".join(parts1))
-
-    # Line 2: EMA20 + RSI + ADX
-    parts2 = []
-    if _on("show_ema") and snap.ema20 is not None:
-        parts2.append(f"EMA20 {fmt_ohlc(snap.ema20, symbol, sinfo)}")
-
+    # Line 4: RSI(14) — last 3 values separated by '-' + OB/OS zone
     if _on("show_rsi") and snap.rsi is not None:
         rsi_vals = [f"{snap.rsi:.1f}"]
         if snap.rsi_prev is not None:
             rsi_vals.append(f"{snap.rsi_prev:.1f}")
         if snap.rsi_prev2 is not None:
             rsi_vals.append(f"{snap.rsi_prev2:.1f}")
+        rsi_str = " - ".join(rsi_vals)
         zone = ""
         if snap.rsi > 70:
             zone = " OB"
         elif snap.rsi < 30:
             zone = " OS"
-        parts2.append(f"RSI {' '.join(rsi_vals)}{zone}")
+        lines.append(f"RSI {rsi_str}{zone}")
 
+    # Line 5: ADX(14) with +DI/-DI + strength
     if _on("show_adx") and snap.adx is not None:
         strength = ""
-        if snap.adx > 25:
-            strength = " strong" if snap.adx > 50 else " present"
+        if snap.adx > 50:
+            strength = " strong"
+        elif snap.adx > 25:
+            strength = " present"
         di_str = ""
         if snap.di_plus is not None and snap.di_minus is not None:
             di_str = f" +DI {snap.di_plus:.0f} -DI {snap.di_minus:.0f}"
-        parts2.append(f"ADX {snap.adx:.0f}{di_str}{strength}")
-
-    if parts2:
-        lines.append("  ".join(parts2))
+        lines.append(f"ADX {snap.adx:.0f}{di_str}{strength}")
 
     return "\n".join(lines)
 

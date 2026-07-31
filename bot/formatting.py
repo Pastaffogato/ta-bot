@@ -129,8 +129,8 @@ def format_candle_message(
                 sign = "+" if dist_pips >= 0 else ""
                 lines.append(f"📍 M{m.user_seq} {fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
 
-    # Indicators — show when pref is on and data available
-    if ind_snap is not None and prefs.get("show_indicators", "off") != "off":
+    # Indicators — show when pref is on and data available (default on)
+    if ind_snap is not None and prefs.get("show_indicators", "on") != "off":
         from bot.indicators import format_indicator_section
         indicator_text = format_indicator_section(ind_snap, symbol, sinfo, prefs)
         if indicator_text:
