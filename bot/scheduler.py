@@ -196,12 +196,12 @@ async def _send_group(
 
         sinfo = await mt5_data.symbol_info(symbol)
 
-        # ── indicator computation (fetch 51 bars for SMA50) ──
+        # ── indicator computation (fetch 52 bars, skip current for completed candle) ──
         ind_snap = None
         try:
-            bars = await mt5_data.bars_n(symbol, tf_min, 51)
+            bars = await mt5_data.bars_n(symbol, tf_min, 52)
             if bars:
-                ind_snap = indicators.compute_all(bars)
+                ind_snap = indicators.compute_all(bars, skip_current=True)
         except Exception:
             logger.debug("Indicator fetch failed for %s %s", symbol, tf_label(tf_min))
     else:

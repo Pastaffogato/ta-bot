@@ -132,7 +132,7 @@ def format_candle_message(
     # Indicators — show when pref is on and data available
     if ind_snap is not None and prefs.get("show_indicators", "off") != "off":
         from bot.indicators import format_indicator_section
-        indicator_text = format_indicator_section(ind_snap, symbol, sinfo)
+        indicator_text = format_indicator_section(ind_snap, symbol, sinfo, prefs)
         if indicator_text:
             lines.append(indicator_text)
 

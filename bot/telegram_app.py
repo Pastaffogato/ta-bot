@@ -114,7 +114,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/offset 8 — pre-close seconds\n\n"
         "<b>OHLC data:</b>\n"
         "/now XAUUSD 3 — live M3 OHLC\n"
-        "/level XAUUSD — yesterday OHLC\n\n"
+        "/level XAUUSD — yesterday OHLC\n"
+        "/ind XAUUSD 5 — indicator snapshot\n\n"
         "<b>Price alerts:</b>\n"
         "/price XAUUSD 2400 — cross alert\n"
         "/price XAUUSD above 2400 — directional\n"
@@ -136,7 +137,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/modify t1 tp 2420 — move take profit\n"
         "/modify t1 close — close at market\n\n"
         "<b>Other:</b>\n"
-        "/data — toggle OHLC data sections\n"
+        "/data — toggle OHLC + indicator sections\n"
         "/clear — clear all alerts + marks\n"
         "/status — bot health\n"
         "/help — this text\n\n"
@@ -916,7 +917,11 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.ensure_user(chat_id)
     args = context.args
 
-    VALID_PREFS = {"show_pattern", "show_ohlc", "show_range_body", "show_bid_ask", "show_marks", "show_indicators"}
+    VALID_PREFS = {
+        "show_pattern", "show_ohlc", "show_range_body", "show_bid_ask",
+        "show_marks", "show_indicators",
+        "show_sma", "show_ema", "show_bb", "show_atr", "show_rsi", "show_adx",
+    }
 
     if not args:
         prefs = db.get_user_prefs(chat_id)
@@ -1114,14 +1119,14 @@ async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     sinfo = await mt5_data.symbol_info(symbol)
 
-    bars = await mt5_data.bars_n(symbol, tf_min, 51)
+    bars = await mt5_data.bars_n(symbol, tf_min, 52)
     if not bars:
         await update.message.reply_text(_err("No bar data available"))
         return
 
     from bot.indicators import compute_all, format_indicator_full
 
-    snap = compute_all(bars)
+    snap = compute_all(bars, skip_current=True)
     display = _display_symbol(symbol)
     header = f"{display.upper()} {tf_label(tf_min)}  Bid: {_fmt_ohlc(tick.bid, symbol, sinfo)}"
     report = format_indicator_full(snap, symbol, sinfo)

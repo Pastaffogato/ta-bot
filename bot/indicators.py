@@ -3,7 +3,7 @@
 All functions operate on numpy arrays in chronological order (oldest first).
 Bars are passed newest-first and reversed internally.
 
-BB(20,2) on close, SMA50, ATR(14), RSI(14), ADX(14), EMA(20), VWAP, RelVol.
+SMA50, EMA20 (on close), BB(20,2) on close, ATR(14), RSI(14), ADX(14) with +DI/-DI.
 """
 
 from dataclasses import dataclass, field
@@ -22,33 +22,43 @@ class IndicatorSnapshot:
     bb_middle: Optional[float] = None
     bb_lower: Optional[float] = None
     bb_width_pct: Optional[float] = None  # (upper - lower) / middle * 100
-    atr: Optional[float] = None  # ATR(14)
+    atr: Optional[float] = None  # ATR(14) — latest
+    atr_prev: Optional[float] = None  # ATR(14) — 1 bar ago
+    atr_prev2: Optional[float] = None  # ATR(14) — 2 bars ago
     atr_pct: Optional[float] = None  # ATR / close * 100
-    atr_trend: Optional[str] = None  # "rising", "compressing", "flat"
-    rsi: Optional[float] = None  # RSI(14)
+    rsi: Optional[float] = None  # RSI(14) — latest
+    rsi_prev: Optional[float] = None  # RSI(14) — 1 bar ago
+    rsi_prev2: Optional[float] = None  # RSI(14) — 2 bars ago
     adx: Optional[float] = None  # ADX(14), 0-100
-    vwap: Optional[float] = None
-    rel_volume: Optional[float] = None  # current vol / avg vol(20)
+    di_plus: Optional[float] = None  # +DI(14)
+    di_minus: Optional[float] = None  # -DI(14)
     current_close: Optional[float] = None
     bar_count: int = 0
 
 
-def compute_all(bars: list) -> IndicatorSnapshot:
+def compute_all(bars: list, skip_current: bool = False) -> IndicatorSnapshot:
     """Compute all indicators from a list of Bar objects (newest first).
 
-    Requires at least 20 bars for BB/EMA, 50 for SMA50, 15 for ATR/RSI/ADX.
+    Requires at least 20 bars for BB/EMA, 50 for SMA50, 15 for ATR/RSI, 28 for ADX.
     Missing indicators are left as None.
+
+    When skip_current=True, the newest bar (position 0) is excluded so indicators
+    reflect the previous completed candle.
     """
     if not bars:
         return IndicatorSnapshot()
 
+    if skip_current and len(bars) > 1:
+        bars = bars[1:]  # skip the current incomplete bar
+
     n = len(bars)
+    if n == 0:
+        return IndicatorSnapshot()
 
     # Reverse to chronological order (oldest first)
     closes = np.array([b.close for b in reversed(bars)], dtype=np.float64)
     highs = np.array([b.high for b in reversed(bars)], dtype=np.float64)
     lows = np.array([b.low for b in reversed(bars)], dtype=np.float64)
-    volumes = np.array([b.tick_volume for b in reversed(bars)], dtype=np.float64)
 
     snap = IndicatorSnapshot(bar_count=n, current_close=float(closes[-1]))
 
@@ -56,46 +66,48 @@ def compute_all(bars: list) -> IndicatorSnapshot:
     if n >= 50:
         snap.sma50 = float(np.mean(closes[-50:]))
 
-    # ── EMA 20 ──
+    # ── EMA 20 (seeded with SMA of first 20 closes) ──
     if n >= 20:
         snap.ema20 = _ema(closes, 20)
 
     # ── Bollinger Bands (20, 2) on close ──
     if n >= 20:
-        sma20 = np.mean(closes[-20:])
-        std20 = np.std(closes[-20:], ddof=0)  # population std (standard BB formula)
-        snap.bb_middle = float(sma20)
-        snap.bb_upper = float(sma20 + 2.0 * std20)
-        snap.bb_lower = float(sma20 - 2.0 * std20)
+        sma20 = float(np.mean(closes[-20:]))
+        std20 = float(np.std(closes[-20:], ddof=0))  # population std (standard BB formula)
+        snap.bb_middle = sma20
+        snap.bb_upper = sma20 + 2.0 * std20
+        snap.bb_lower = sma20 - 2.0 * std20
         if sma20 > 0:
             snap.bb_width_pct = float((snap.bb_upper - snap.bb_lower) / sma20 * 100)
 
-    # ── ATR(14) ──
+    # ── ATR(14) with rolling last 3 ──
     if n >= 15:
-        snap.atr = _atr(highs, lows, closes, 14)
-        if snap.current_close and snap.current_close > 0:
+        atr_vals = _rolling_atr(highs, lows, closes, 14)
+        if len(atr_vals) >= 1:
+            snap.atr = atr_vals[-1]
+        if len(atr_vals) >= 2:
+            snap.atr_prev = atr_vals[-2]
+        if len(atr_vals) >= 3:
+            snap.atr_prev2 = atr_vals[-3]
+        if snap.atr is not None and snap.current_close and snap.current_close > 0:
             snap.atr_pct = snap.atr / snap.current_close * 100
-        # ATR trend: compare average of first 3 vs last 3 of last 14 TR values
-        snap.atr_trend = _atr_trend(highs, lows, closes, 14)
 
-    # ── RSI(14) ──
+    # ── RSI(14) with rolling last 3 ──
     if n >= 15:
-        snap.rsi = _rsi(closes, 14)
+        rsi_vals = _rolling_rsi(closes, 14)
+        if len(rsi_vals) >= 1:
+            snap.rsi = rsi_vals[-1]
+        if len(rsi_vals) >= 2:
+            snap.rsi_prev = rsi_vals[-2]
+        if len(rsi_vals) >= 3:
+            snap.rsi_prev2 = rsi_vals[-3]
 
-    # ── ADX(14) ──
-    if n >= 28:  # need 2*period for proper ADX
-        snap.adx = _adx(highs, lows, closes, 14)
-
-    # ── VWAP ──
-    if n > 0 and np.sum(volumes) > 0:
-        typical = (highs + lows + closes) / 3.0
-        snap.vwap = float(np.sum(typical * volumes) / np.sum(volumes))
-
-    # ── Relative Volume ──
-    if n >= 21:
-        avg_vol = np.mean(volumes[-21:-1])  # avg of last 20 bars (excluding current)
-        if avg_vol > 0:
-            snap.rel_volume = float(volumes[-1] / avg_vol)
+    # ── ADX(14) with +DI/-DI ──
+    if n >= 28:
+        adx_val, di_p, di_m = _adx(highs, lows, closes, 14)
+        snap.adx = adx_val
+        snap.di_plus = di_p
+        snap.di_minus = di_m
 
     return snap
 
@@ -104,10 +116,11 @@ def compute_all(bars: list) -> IndicatorSnapshot:
 
 
 def _ema(data: np.ndarray, period: int) -> float:
-    """Exponential moving average. Returns the most recent value."""
+    """Exponential moving average seeded with SMA of first `period` values."""
     alpha = 2.0 / (period + 1.0)
-    result = data[0]
-    for i in range(1, len(data)):
+    # Seed with SMA of first `period` values
+    result = float(np.mean(data[:period]))
+    for i in range(period, len(data)):
         result = alpha * data[i] + (1.0 - alpha) * result
     return float(result)
 
@@ -124,154 +137,195 @@ def _true_range(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> np.n
     return tr
 
 
-def _atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> float:
-    """Average True Range (Wilder's smoothing)."""
+def _smooth_wilder(values: np.ndarray, period: int) -> list[float]:
+    """Wilder's smoothing: first value = simple average of first `period` values,
+    subsequent = (prev * (period-1) + current) / period.
+    Returns list of smoothed values (one per bar from index `period-1` onward)."""
+    if len(values) <= period:
+        return []
+    result = [float(np.mean(values[:period]))]
+    for i in range(period, len(values)):
+        result.append((result[-1] * (period - 1) + values[i]) / period)
+    return result
+
+
+def _rolling_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> list[float]:
+    """Compute rolling ATR values (Wilder's smoothing). Returns list of ATR values."""
     tr = _true_range(highs, lows, closes)
-    atr_val = float(np.mean(tr[1:period + 1]))  # first ATR = simple average of first `period` TR
-    for i in range(period + 1, len(tr)):
-        atr_val = (atr_val * (period - 1) + tr[i]) / period
-    return float(atr_val)
+    return _smooth_wilder(tr, period)
 
 
-def _atr_trend(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> str:
-    """ATR trend: compare rolling ATR(3) at start vs end of last 14 TR values."""
-    tr = _true_range(highs, lows, closes)
-    if len(tr) < period + 3:
-        return "flat"
-    # ATR over the last `period` values at the tail
-    start_window = tr[-period - 3:-period]
-    end_window = tr[-3:]
-    start_avg = float(np.mean(start_window))
-    end_avg = float(np.mean(end_window))
-    if start_avg <= 0:
-        return "flat"
-    change = (end_avg - start_avg) / start_avg
-    if change > 0.05:
-        return "rising"
-    elif change < -0.05:
-        return "compressing"
-    return "flat"
-
-
-def _rsi(closes: np.ndarray, period: int) -> float:
-    """RSI (Wilder's smoothing)."""
+def _rolling_rsi(closes: np.ndarray, period: int) -> list[float]:
+    """Compute rolling RSI values (Wilder's smoothing). Returns list of RSI values."""
     deltas = np.diff(closes)
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
 
+    if len(gains) <= period:
+        return []
+
     avg_gain = float(np.mean(gains[:period]))
     avg_loss = float(np.mean(losses[:period]))
+
+    rsi_vals = []
+    # Compute RSI at each step after the initial period
+    rsi = _rsi_from_avgs(avg_gain, avg_loss)
+    rsi_vals.append(rsi)
 
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi = _rsi_from_avgs(avg_gain, avg_loss)
+        rsi_vals.append(rsi)
 
+    return rsi_vals
+
+
+def _rsi_from_avgs(avg_gain: float, avg_loss: float) -> float:
+    """RSI from average gain and loss."""
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    return float(100.0 - (100.0 / (1.0 + rs)))
+    return float(100.0 - 100.0 / (1.0 + rs))
 
 
-def _adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> float:
-    """Average Directional Index (Wilder's smoothing)."""
+def _adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14):
+    """Compute ADX(period) with +DI and -DI using Wilder's smoothing.
+
+    Returns (adx, di_plus, di_minus) — the latest values.
+    """
     n = len(highs)
-    if n < period + 1:
-        return 0.0
 
-    up_move = np.zeros(n, dtype=np.float64)
-    down_move = np.zeros(n, dtype=np.float64)
-
+    # True Range
     tr = _true_range(highs, lows, closes)
 
+    # +DM and -DM
+    plus_dm = np.zeros(n, dtype=np.float64)
+    minus_dm = np.zeros(n, dtype=np.float64)
     for i in range(1, n):
         up = highs[i] - highs[i - 1]
         down = lows[i - 1] - lows[i]
         if up > down and up > 0:
-            up_move[i] = up
-        else:
-            up_move[i] = 0.0
+            plus_dm[i] = up
         if down > up and down > 0:
-            down_move[i] = down
+            minus_dm[i] = down
+
+    # Wilder's smoothing for TR, +DM, -DM
+    tr_smooth = _smooth_wilder(tr, period)
+    pdm_smooth = _smooth_wilder(plus_dm, period)
+    mdm_smooth = _smooth_wilder(minus_dm, period)
+
+    if not tr_smooth:
+        return 0.0, 0.0, 0.0
+
+    # Compute +DI, -DI, and DX for each smoothed step
+    dx_vals = []
+    di_plus_last = 0.0
+    di_minus_last = 0.0
+
+    for i in range(len(tr_smooth)):
+        if tr_smooth[i] > 0:
+            di_p = 100.0 * pdm_smooth[i] / tr_smooth[i]
+            di_m = 100.0 * mdm_smooth[i] / tr_smooth[i]
         else:
-            down_move[i] = 0.0
+            di_p = 0.0
+            di_m = 0.0
 
-    # First period: simple average
-    atr_period = float(np.mean(tr[1:period + 1]))
-    avg_up = float(np.mean(up_move[1:period + 1]))
-    avg_down = float(np.mean(down_move[1:period + 1]))
+        di_plus_last = di_p
+        di_minus_last = di_m
 
-    # Wilder's smoothing
-    for i in range(period + 1, n):
-        atr_period = (atr_period * (period - 1) + tr[i]) / period
-        avg_up = (avg_up * (period - 1) + up_move[i]) / period
-        avg_down = (avg_down * (period - 1) + down_move[i]) / period
+        di_sum = di_p + di_m
+        if di_sum > 0:
+            dx = 100.0 * abs(di_p - di_m) / di_sum
+        else:
+            dx = 0.0
+        dx_vals.append(dx)
 
-    if atr_period <= 0:
-        return 0.0
+    # Smooth DX to get ADX (Wilder's smoothing)
+    if len(dx_vals) < period:
+        return float(dx_vals[-1]) if dx_vals else 0.0, di_plus_last, di_minus_last
 
-    di_plus = (avg_up / atr_period) * 100.0
-    di_minus = (avg_down / atr_period) * 100.0
-    di_sum = di_plus + di_minus
+    adx_smooth = _smooth_wilder(np.array(dx_vals, dtype=np.float64), period)
+    adx_val = adx_smooth[-1] if adx_smooth else (dx_vals[-1] if dx_vals else 0.0)
 
-    if di_sum <= 0:
-        return 0.0
-
-    dx = abs(di_plus - di_minus) / di_sum * 100.0
-
-    # ADX = EMA of DX (period=14)
-    # We only have one DX — in a full implementation we'd compute the rolling DX
-    # and then average. For a snapshot with limited bars, we compute DX from the
-    # final smoothed values and return it directly (same as last ADX tick).
-    return float(dx)
+    return float(adx_val), float(di_plus_last), float(di_minus_last)
 
 
-def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
+# ── formatting ──
+
+
+def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs: dict = None) -> str:
     """Build a compact indicator display section for candle alerts.
 
-    Two lines max:
-    Line 1: ATR, SMA50, BB
-    Line 2: RSI, VWAP, RVOL, ADX
+    Two lines:
+    Line 1: ATR(14) with last 3 values + SMA50 + BB (high, mid, low) + width in pips
+    Line 2: EMA20 + RSI(14) with last 3 values + ADX(14) with +DI/-DI
+
+    Respects granular prefs: show_sma, show_ema, show_bb, show_atr, show_rsi, show_adx.
+    When a granular pref is "off", that indicator is hidden (along with its line if empty).
+    show_indicators=off skips everything.
     """
     from bot.formatting import fmt_ohlc
 
+    if prefs is None:
+        prefs = {}
+
     lines = []
+    pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+
+    def _on(key):
+        return prefs.get(key, "on") != "off"
 
     # Line 1: ATR + SMA50 + BB
     parts1 = []
-    if snap.atr is not None:
-        atr_str = fmt_ohlc(snap.atr, symbol, sinfo) if sinfo else f"{snap.atr:.5f}"
-        trend = {"rising": "▲", "compressing": "▼", "flat": "─"}.get(snap.atr_trend, "")
-        parts1.append(f"ATR {atr_str}{trend}")
-    if snap.sma50 is not None:
+    if _on("show_atr") and snap.atr is not None:
+        atr_vals = [snap.atr]
+        if snap.atr_prev is not None:
+            atr_vals.append(snap.atr_prev)
+        if snap.atr_prev2 is not None:
+            atr_vals.append(snap.atr_prev2)
+        atr_str = " ".join(fmt_ohlc(v, symbol, sinfo) if sinfo else f"{v:.5f}" for v in atr_vals)
+        parts1.append(f"ATR {atr_str}")
+
+    if _on("show_sma") and snap.sma50 is not None:
         parts1.append(f"SMA50 {fmt_ohlc(snap.sma50, symbol, sinfo)}")
-    if snap.bb_upper is not None:
-        parts1.append(
-            f"BB {fmt_ohlc(snap.bb_lower, symbol, sinfo)}–{fmt_ohlc(snap.bb_upper, symbol, sinfo)}"
-        )
+
+    if _on("show_bb") and snap.bb_upper is not None:
+        bb_high = fmt_ohlc(snap.bb_upper, symbol, sinfo)
+        bb_mid = fmt_ohlc(snap.bb_middle, symbol, sinfo)
+        bb_low = fmt_ohlc(snap.bb_lower, symbol, sinfo)
+        bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
+        parts1.append(f"BB {bb_high} {bb_mid} {bb_low} ({bb_width_pips:.1f}p)")
 
     if parts1:
         lines.append("  ".join(parts1))
 
-    # Line 2: RSI + VWAP + RVOL + ADX
+    # Line 2: EMA20 + RSI + ADX
     parts2 = []
-    if snap.rsi is not None:
+    if _on("show_ema") and snap.ema20 is not None:
+        parts2.append(f"EMA20 {fmt_ohlc(snap.ema20, symbol, sinfo)}")
+
+    if _on("show_rsi") and snap.rsi is not None:
+        rsi_vals = [f"{snap.rsi:.1f}"]
+        if snap.rsi_prev is not None:
+            rsi_vals.append(f"{snap.rsi_prev:.1f}")
+        if snap.rsi_prev2 is not None:
+            rsi_vals.append(f"{snap.rsi_prev2:.1f}")
         zone = ""
         if snap.rsi > 70:
             zone = " OB"
         elif snap.rsi < 30:
             zone = " OS"
-        parts2.append(f"RSI {snap.rsi:.1f}{zone}")
-    if snap.vwap is not None and snap.current_close is not None:
-        vwap_str = fmt_ohlc(snap.vwap, symbol, sinfo)
-        above = "▲" if snap.current_close > snap.vwap else "▼"
-        parts2.append(f"VWAP {vwap_str}{above}")
-    if snap.rel_volume is not None:
-        parts2.append(f"RVOL {snap.rel_volume:.1f}x")
-    if snap.adx is not None:
+        parts2.append(f"RSI {' '.join(rsi_vals)}{zone}")
+
+    if _on("show_adx") and snap.adx is not None:
         strength = ""
         if snap.adx > 25:
             strength = " strong" if snap.adx > 50 else " present"
-        parts2.append(f"ADX {snap.adx:.0f}{strength}")
+        di_str = ""
+        if snap.di_plus is not None and snap.di_minus is not None:
+            di_str = f" +DI {snap.di_plus:.0f} -DI {snap.di_minus:.0f}"
+        parts2.append(f"ADX {snap.adx:.0f}{di_str}{strength}")
 
     if parts2:
         lines.append("  ".join(parts2))
@@ -282,6 +336,8 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo) -> str
 def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
     """Build a full indicator report for /ind command."""
     from bot.formatting import fmt_ohlc
+
+    pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
 
     parts = ["📊 Indicator Snapshot"]
 
@@ -294,45 +350,43 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
         parts.append(f"EMA(20): {fmt_ohlc(snap.ema20, symbol, sinfo)}")
 
     if snap.bb_upper is not None:
+        bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
         parts.append(
-            f"BB(20,2): {fmt_ohlc(snap.bb_lower, symbol, sinfo)} — "
+            f"BB(20,2): {fmt_ohlc(snap.bb_upper, symbol, sinfo)} — "
             f"{fmt_ohlc(snap.bb_middle, symbol, sinfo)} — "
-            f"{fmt_ohlc(snap.bb_upper, symbol, sinfo)}"
+            f"{fmt_ohlc(snap.bb_lower, symbol, sinfo)}"
         )
-        if snap.bb_width_pct is not None:
-            parts.append(f"  Width: {snap.bb_width_pct:.1f}%")
+        parts.append(f"  Width: {bb_width_pips:.1f}p ({snap.bb_width_pct:.1f}%)" if snap.bb_width_pct else f"  Width: {bb_width_pips:.1f}p")
 
     if snap.atr is not None:
-        trend_label = {"rising": "rising", "compressing": "compressing", "flat": "flat"}
-        parts.append(
-            f"ATR(14): {fmt_ohlc(snap.atr, symbol, sinfo)}"
-            + (f" ({snap.atr_pct:.2f}%)" if snap.atr_pct else "")
-            + f" — {trend_label.get(snap.atr_trend, snap.atr_trend)}"
-        )
+        atr_now = fmt_ohlc(snap.atr, symbol, sinfo)
+        pct_str = f" ({snap.atr_pct:.2f}%)" if snap.atr_pct else ""
+        prev_str = ""
+        if snap.atr_prev is not None:
+            prev_str += f" | Prev: {fmt_ohlc(snap.atr_prev, symbol, sinfo)}"
+        if snap.atr_prev2 is not None:
+            prev_str += f" | Prev2: {fmt_ohlc(snap.atr_prev2, symbol, sinfo)}"
+        parts.append(f"ATR(14): {atr_now}{pct_str}{prev_str}")
 
     if snap.rsi is not None:
+        rsi_str = f"{snap.rsi:.1f}"
+        if snap.rsi_prev is not None:
+            rsi_str += f" | Prev: {snap.rsi_prev:.1f}"
+        if snap.rsi_prev2 is not None:
+            rsi_str += f" | Prev2: {snap.rsi_prev2:.1f}"
         zone = ""
         if snap.rsi > 70:
             zone = " (overbought)"
         elif snap.rsi < 30:
             zone = " (oversold)"
-        parts.append(f"RSI(14): {snap.rsi:.1f}{zone}")
+        parts.append(f"RSI(14): {rsi_str}{zone}")
 
     if snap.adx is not None:
         strength = "strong trend" if snap.adx > 50 else ("trending" if snap.adx > 25 else "weak/ranging")
-        parts.append(f"ADX(14): {snap.adx:.1f} — {strength}")
-
-    if snap.vwap is not None and snap.current_close is not None:
-        diff = snap.current_close - snap.vwap
-        sign = "+" if diff >= 0 else ""
-        parts.append(
-            f"VWAP: {fmt_ohlc(snap.vwap, symbol, sinfo)} "
-            f"(price {sign}{fmt_ohlc(abs(diff), symbol, sinfo)} {'above' if diff >= 0 else 'below'})"
-        )
-
-    if snap.rel_volume is not None:
-        label = "high" if snap.rel_volume > 1.5 else ("low" if snap.rel_volume < 0.5 else "normal")
-        parts.append(f"RelVol: {snap.rel_volume:.1f}x — {label}")
+        di_str = ""
+        if snap.di_plus is not None and snap.di_minus is not None:
+            di_str = f" | +DI: {snap.di_plus:.1f} | -DI: {snap.di_minus:.1f}"
+        parts.append(f"ADX(14): {snap.adx:.1f}{di_str} — {strength}")
 
     if snap.current_close is not None:
         parts.append(f"Close: {fmt_ohlc(snap.current_close, symbol, sinfo)}")
