@@ -829,11 +829,14 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         lines = []
         for t in trades:
-            pnl = _calc_unrealized(t, chat_id)
+            pnl = await _calc_unrealized(t, chat_id)
             ot = f" {t.order_type}" if t.order_type != "market" else ""
+            pending = "⏳" if t.order_type in ("limit", "stop") else ""
+            sl_tp = ""
+            if t.order_type == "market":
+                sl_tp = f" | SL:{_fmt_price(t.stop_loss, t.symbol)} TP:{_fmt_price(t.take_profit, t.symbol)}"
             lines.append(
-                f"t{t.user_seq} {_display_symbol(t.symbol).upper()} {t.direction.upper()}{ot} @ {_fmt_price(t.entry_price, t.symbol)}"
-                f" | SL:{_fmt_price(t.stop_loss, t.symbol)} TP:{_fmt_price(t.take_profit, t.symbol)}"
+                f"{pending}t{t.user_seq} {_display_symbol(t.symbol).upper()} {t.direction.upper()}{ot} @ {_fmt_price(t.entry_price, t.symbol)}{sl_tp}"
                 f" | {pnl:+.1f}p"
             )
         await update.message.reply_text("\n".join(lines))
@@ -928,10 +931,12 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         f"📊 t{trade.user_seq} {display.upper()} {direction.upper()} {order_type.upper()} @ {_fmt_price(entry_price, resolved)}",
     ]
-    if stop_loss:
-        lines.append(f"  SL: {_fmt_price(stop_loss, resolved)}")
-    if take_profit:
-        lines.append(f"  TP: {_fmt_price(take_profit, resolved)}")
+    if stop_loss or take_profit:
+        pending = " (pending)" if order_type in ("limit", "stop") else ""
+        if stop_loss:
+            lines.append(f"  SL: {_fmt_price(stop_loss, resolved)}{pending}")
+        if take_profit:
+            lines.append(f"  TP: {_fmt_price(take_profit, resolved)}{pending}")
     await update.message.reply_text("\n".join(lines))
 
 

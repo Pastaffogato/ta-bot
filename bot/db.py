@@ -144,6 +144,12 @@ def init_db() -> None:
     if "alert_type" not in cols or "target_upper" not in cols or "expires_at" not in cols:
         conn.commit()
 
+    # Migration: add order_type to paper_trades
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(paper_trades)").fetchall()]
+    if cols and "order_type" not in cols:
+        conn.execute("ALTER TABLE paper_trades ADD COLUMN order_type TEXT NOT NULL DEFAULT 'market'")
+        conn.commit()
+
     # Migration: add user_seq to marks + backfill
     cols = [r[1] for r in conn.execute("PRAGMA table_info(marks)").fetchall()]
     if "user_seq" not in cols:
