@@ -271,18 +271,20 @@ async def _process_price_alerts(
             if prev_bar:
                 prev_close = prev_bar.close
 
-        # For indicator-based alerts, compute a snapshot once per symbol per cycle.
-        # We use M1 bars as a sensible default timeframe for the dynamic target —
-        # the indicator value moves with each M1 close.
-        ind_snap = None
+        # For indicator-based alerts, compute a snapshot per (symbol, indicator_tf).
+        # The indicator timeframe is stored on each alert and is independent of any
+        # candle-alert TF. We use skip_current=True so the target reflects the last
+        # completed bar of that timeframe (stable, not self-referential with the tick).
+        ind_snaps: dict[tuple[str, int], "indicators.IndicatorSnapshot"] = {}
         indicator_alerts = [a for a in alerts if a.symbol == symbol and a.indicator]
-        if indicator_alerts:
+        seen_tfs = {a.indicator_timeframe_min for a in indicator_alerts if a.indicator_timeframe_min}
+        for ind_tf in seen_tfs:
             try:
-                bars = await mt5_data.bars_n(symbol, 1, 500)
+                bars = await mt5_data.bars_n(symbol, ind_tf, 500)
                 if bars:
-                    ind_snap = indicators.compute_all(bars, skip_current=False)
+                    ind_snaps[(symbol, ind_tf)] = indicators.compute_all(bars, skip_current=True)
             except Exception:
-                logger.debug("Indicator snapshot failed for %s", symbol)
+                logger.debug("Indicator snapshot failed for %s @ %s", symbol, tf_label(ind_tf))
 
         for alert in alerts:
             if alert.symbol != symbol:
@@ -290,12 +292,21 @@ async def _process_price_alerts(
 
             # ── indicator-based crossing alert ──
             # The target is dynamic: resolved from the indicator snapshot each cycle.
+            # The snapshot is keyed by (symbol, the alert's indicator timeframe).
             if alert.indicator:
+                ind_tf = alert.indicator_timeframe_min
+                ind_snap = ind_snaps.get((symbol, ind_tf)) if ind_tf else None
                 if ind_snap is None:
                     continue
                 dynamic_target = indicators.resolve_indicator_target(ind_snap, alert.indicator)
                 if dynamic_target is None:
                     continue  # indicator not available yet (e.g. not enough bars)
+
+                # Persist the resolved target so /list and progression lines show a
+                # real value instead of the 0.0 placeholder.
+                if alert.target != dynamic_target:
+                    db.update_price_alert(alert.id, target=dynamic_target)
+                    alert.target = dynamic_target
 
                 # Use the dynamic target instead of the stored static target
                 alert_target = dynamic_target

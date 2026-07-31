@@ -120,7 +120,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Price alerts:</b>\n"
         "/price XAUUSD 2400 — cross alert\n"
         "/price XAUUSD above 2400 — directional\n"
-        "/price sma50 above — indicator crossing\n"
+        "/price sma50 h1 above — indicator crossing (TF required)\n"
+        "/price bb_lower h4 — indicator, either direction\n"
         "/cancel p7 — remove price alert\n"
         "/cancel — cancel all price alerts\n\n"
         "<b>Marks:</b>\n"
@@ -135,6 +136,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/entry XAUUSD buy +50 -30 — market buy, TP+50, SL-30\n"
         "/entry XAUUSD sell limit 2410 +30 — sell limit\n"
         "/entry XAUUSD buy stop 2420 +20 — buy stop\n"
+        "/entry XAUUSD buy tp sma50@h1 sl bb_lower@h4 — indicator TP/SL\n"
         "/modify t1 sl 2390 — move stop loss\n"
         "/modify t1 tp 2420 — move take profit\n"
         "/modify t1 close — close at market\n\n"
@@ -346,7 +348,14 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for a in price_alerts:
             display = _display_symbol(a.symbol)
             dir_str = f" {a.direction}" if a.direction else ""
-            lines.append(f"  p{a.user_seq} {display.upper()}{dir_str} {a.target}")
+            if a.indicator:
+                from bot.indicators import indicator_display_label
+                label = indicator_display_label(a.indicator)
+                ind_tf = tf_label(a.indicator_timeframe_min) if a.indicator_timeframe_min else "?"
+                tgt = _fmt_price(a.target, a.symbol) if a.target else "—"
+                lines.append(f"  p{a.user_seq} {display.upper()}{dir_str} {label} @ {ind_tf} ({tgt})")
+            else:
+                lines.append(f"  p{a.user_seq} {display.upper()}{dir_str} {a.target}")
 
     focus = _get_focus(chat_id)
     if focus:
@@ -500,8 +509,8 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  /price close 2400 2450 (close range, smart-sorted)\n"
             "  /price close 2400 (cross and close)\n"
             "  /price 2400 30m (expires in 30 minutes)\n"
-            "  /price sma50 above (indicator crossing)\n"
-            "  /price bb_lower (indicator, either direction)"
+            "  /price sma50 h1 above (indicator crossing — TF required)\n"
+            "  /price bb_lower h4 (indicator, either direction)"
         ))
         return
 
@@ -534,7 +543,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif focus:
         resolved = focus
     elif first.lower() in INDICATOR_TARGETS:
-        await update.message.reply_text(_err("Usage: /price <symbol> <indicator> [above|below]\nOr set focus with /fp first, then /price sma50 above"))
+        await update.message.reply_text(_err("Usage: /price <symbol> <indicator> <TF> [above|below]\nOr set focus with /fp first, then /price sma50 h1 above"))
         return
     else:
         await update.message.reply_text(_err(
@@ -548,12 +557,31 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # ── Indicator-based price alert ──
+    # Syntax: /price [SYMBOL] <INDICATOR> <TF> [above|below] [30m|2h]
+    # The indicator timeframe is REQUIRED and is independent of any candle-alert TF.
     if price_args[0].lower() in INDICATOR_TARGETS:
         ind_name = price_args[0].lower()
+
+        # TF is mandatory and must come right after the indicator name.
+        if len(price_args) < 2:
+            await update.message.reply_text(_err(
+                f"Indicator alert needs a timeframe.\n"
+                f"Usage: /price {_display_symbol(resolved).upper() if resolved else '<symbol>'} {ind_name} <TF> [above|below] [30m|2h]\n"
+                f"Example: /price {ind_name} h1 above"
+            ))
+            return
+        ind_tf = parse_tf(price_args[1])
+        if ind_tf is None:
+            await update.message.reply_text(_err(
+                f"Invalid indicator timeframe: {price_args[1]}\n"
+                f"Use one of: m1, m5, m15, h1, h4, d1, ..."
+            ))
+            return
+
         direction = None
         expiry_s = None
         expiry_label = None
-        for a in price_args[1:]:
+        for a in price_args[2:]:
             if a.lower() in ("above", "below"):
                 direction = a.lower()
             else:
@@ -561,33 +589,34 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 if exp is not None:
                     expiry_s, expiry_label = exp
 
-        # Compute the current indicator value to show the user
+        # Compute the current indicator value (on the requested TF) to show the user.
+        # skip_current=True → use the last completed bar of that TF (stable).
         tick = await mt5_data.tick(resolved)
         if tick is None:
             await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
             return
 
         try:
-            bars = await mt5_data.bars_n(resolved, 1, 500)
-            snap = compute_all(bars, skip_current=False) if bars else None
+            bars = await mt5_data.bars_n(resolved, ind_tf, 500)
+            snap = compute_all(bars, skip_current=True) if bars else None
         except Exception:
             snap = None
 
         current_val = resolve_indicator_target(snap, ind_name) if snap else None
         if current_val is None:
-            await update.message.reply_text(_err(f"Indicator {ind_name} not available yet (need more bars)"))
+            await update.message.reply_text(_err(f"Indicator {ind_name} not available yet on {tf_label(ind_tf)} (need more bars)"))
             return
 
         from datetime import timedelta
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
 
-        # Store with target=0 (placeholder), indicator=ind_name
+        # Store with target=current_val (the resolved indicator value) and the indicator TF.
         alert = db.add_price_alert(
-            chat_id, resolved, 0.0, direction,
+            chat_id, resolved, current_val, direction,
             alert_type="crossing", expires_at=expires_at,
-            indicator=ind_name,
+            indicator=ind_name, indicator_timeframe_min=ind_tf,
         )
-        # Set initial side based on the current indicator value
+        # Set initial side based on the current indicator value vs the live price.
         current_side = "above" if tick.bid > current_val else "below"
         db.update_price_alert(alert.id, last_side=current_side)
         alert.last_side = current_side
@@ -598,10 +627,11 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         exp_str = f" {_fmt_expiry(expires_at)}" if expires_at else ""
         await update.message.reply_text(
             f"✅ Indicator alert p{alert.user_seq}{exp_str}\n"
-            f"{display.upper()} cross{dir_str} {label}\n"
-            f"Current {label}: {_fmt_ohlc(current_val, resolved, None)}\n"
+            f"{display.upper()} cross{dir_str} {label} @ {tf_label(ind_tf)}\n"
+            f"Current {label} ({tf_label(ind_tf)}): {_fmt_ohlc(current_val, resolved, None)}\n"
             f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}\n"
-            f"/cancel p{alert.user_seq} to remove"
+            f"/cancel p{alert.user_seq} to remove",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -881,7 +911,11 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             val = trade_args[i + 1]
             resolved_price = await _resolve_tp_sl_value(val, resolved, entry_price, pip_size)
             if resolved_price is None:
-                await update.message.reply_text(_err(f"Invalid {a.upper()} value: {val}"))
+                hint = ""
+                from bot.indicators import INDICATOR_TARGETS
+                if val.lower() in INDICATOR_TARGETS:
+                    hint = " — indicator TP/SL needs a timeframe, e.g. sma50@h1"
+                await update.message.reply_text(_err(f"Invalid {a.upper()} value: {val}{hint}"))
                 return
             if a == "tp":
                 take_profit = resolved_price
@@ -1011,25 +1045,40 @@ async def _resolve_tp_sl_value(
     """Resolve a TP/SL value to an absolute price.
 
     Supports:
-      - Indicator names: "sma50", "bb_upper", "bb_lower", "bb_middle", "ema20"
-        → resolved from the current M1 indicator snapshot
+      - Indicator names with a required timeframe: "sma50@h1", "bb_lower@M15"
+        → resolved from the indicator snapshot on that timeframe's bars.
+        Bare indicator names (e.g. "sma50" without @TF) are rejected so the
+        user is never silently handed an M1-based level.
       - Relative pips: "+20", "-10" → base_price ± pips
       - Absolute prices: "2420.50" → 2420.50
 
     Returns None if the value cannot be resolved.
     """
     from bot.indicators import INDICATOR_TARGETS, resolve_indicator_target, compute_all
+    from bot.timeframes import parse_tf
 
     val_lower = val.lower()
-    if val_lower in INDICATOR_TARGETS:
-        try:
-            bars = await mt5_data.bars_n(symbol, 1, 500)
-            if not bars:
+
+    # Indicator@TF form (e.g. sma50@h1, bb_lower@m15)
+    if "@" in val_lower:
+        ind_name, tf_str = val_lower.split("@", 1)
+        ind_name = ind_name.strip()
+        if ind_name in INDICATOR_TARGETS:
+            ind_tf = parse_tf(tf_str.strip())
+            if ind_tf is None:
                 return None
-            snap = compute_all(bars, skip_current=False)
-            return resolve_indicator_target(snap, val_lower)
-        except Exception:
-            return None
+            try:
+                bars = await mt5_data.bars_n(symbol, ind_tf, 500)
+                if not bars:
+                    return None
+                snap = compute_all(bars, skip_current=True)
+                return resolve_indicator_target(snap, ind_name)
+            except Exception:
+                return None
+
+    # Bare indicator name without a timeframe — not allowed.
+    if val_lower in INDICATOR_TARGETS:
+        return None
 
     return _resolve_relative_price(val, base_price, pip_size)
 

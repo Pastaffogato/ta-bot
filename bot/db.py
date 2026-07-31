@@ -143,7 +143,9 @@ def init_db() -> None:
         conn.execute("ALTER TABLE price_alerts ADD COLUMN expires_at TEXT")
     if "indicator" not in cols:
         conn.execute("ALTER TABLE price_alerts ADD COLUMN indicator TEXT")
-    if "alert_type" not in cols or "target_upper" not in cols or "expires_at" not in cols or "indicator" not in cols:
+    if "indicator_timeframe_min" not in cols:
+        conn.execute("ALTER TABLE price_alerts ADD COLUMN indicator_timeframe_min INTEGER")
+    if "alert_type" not in cols or "target_upper" not in cols or "expires_at" not in cols or "indicator" not in cols or "indicator_timeframe_min" not in cols:
         conn.commit()
 
     # Migration: add order_type to paper_trades
@@ -271,6 +273,7 @@ def add_price_alert(
     target_upper: Optional[float] = None,
     expires_at: Optional[str] = None,
     indicator: Optional[str] = None,
+    indicator_timeframe_min: Optional[int] = None,
 ) -> PriceAlert:
     with _tx() as conn:
         # Find smallest unused user_seq for this chat_id
@@ -283,9 +286,9 @@ def add_price_alert(
         while next_seq in used:
             next_seq += 1
         cur = conn.execute(
-            "INSERT INTO price_alerts (chat_id, user_seq, symbol, direction, target, alert_type, target_upper, expires_at, indicator)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, next_seq, symbol, direction, target, alert_type, target_upper, expires_at, indicator),
+            "INSERT INTO price_alerts (chat_id, user_seq, symbol, direction, target, alert_type, target_upper, expires_at, indicator, indicator_timeframe_min)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, next_seq, symbol, direction, target, alert_type, target_upper, expires_at, indicator, indicator_timeframe_min),
         )
         row = conn.execute("SELECT * FROM price_alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _row_to_price(row)
@@ -545,6 +548,7 @@ def _row_to_price(row: sqlite3.Row) -> PriceAlert:
         last_side=row["last_side"],
         expires_at=row["expires_at"] if "expires_at" in keys else None,
         indicator=row["indicator"] if "indicator" in keys else None,
+        indicator_timeframe_min=row["indicator_timeframe_min"] if "indicator_timeframe_min" in keys else None,
         created_at=row["created_at"],
     )
 

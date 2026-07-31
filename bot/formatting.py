@@ -148,9 +148,15 @@ def format_candle_message(
             if a.symbol == symbol:
                 if a.indicator:
                     from bot.indicators import indicator_display_label
+                    from bot.timeframes import tf_label as _tf_label
                     label = indicator_display_label(a.indicator)
-                    dist = (tick.bid - a.target) / pip_size
-                    lines.append(f"🔔 p{a.user_seq} {label} {dist:+.1f}p")
+                    ind_tf = _tf_label(a.indicator_timeframe_min) if a.indicator_timeframe_min else "?"
+                    # target may briefly be 0.0 before the first scheduler cycle resolves it.
+                    if a.target and a.target > 0:
+                        dist = (tick.bid - a.target) / pip_size
+                        lines.append(f"🔔 p{a.user_seq} {label} @ {ind_tf} ({fmt_ohlc(a.target, symbol, sinfo)}) {dist:+.1f}p")
+                    else:
+                        lines.append(f"🔔 p{a.user_seq} {label} @ {ind_tf} (resolving)")
                 else:
                     dist = (tick.bid - a.target) / pip_size
                     lines.append(f"🔔 p{a.user_seq} {a.target:.2f} {dist:+.1f}p")
@@ -183,9 +189,11 @@ def format_price_alert_message(
     disp = display_symbol(alert.symbol)
     if alert.indicator:
         from bot.indicators import indicator_display_label
+        from bot.timeframes import tf_label
         label = indicator_display_label(alert.indicator)
+        ind_tf = tf_label(alert.indicator_timeframe_min) if alert.indicator_timeframe_min else "?"
         dir_str = f"crossed {alert.direction}" if alert.direction else "crossed"
-        msg = f"🔔 <b>{disp.upper()}</b> {dir_str} {label} ({fmt_ohlc(alert.target, alert.symbol, None)})!\n"
+        msg = f"🔔 <b>{disp.upper()}</b> {dir_str} {label} @ {ind_tf} ({fmt_ohlc(alert.target, alert.symbol, None)})!\n"
     elif alert.alert_type == "close":
         if alert.target_upper is not None:
             msg = f"🔔 <b>{disp.upper()}</b> closed within {alert.target:.2f}–{alert.target_upper:.2f}!\n"
