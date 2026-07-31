@@ -29,10 +29,13 @@ class PriceAlert:
     symbol: str = ""
     direction: Optional[str] = None
     target: float = 0.0
+    target_upper: Optional[float] = None  # close-range upper bound
+    alert_type: str = "crossing"  # "crossing" or "close"
     price_source: str = "bid"
     repeat: bool = False
     enabled: bool = True
     last_side: Optional[str] = None
+    expires_at: Optional[str] = None  # ISO timestamp, None = indefinite
     created_at: str = ""
 
 

@@ -57,10 +57,13 @@ def init_db() -> None:
             symbol        TEXT NOT NULL,
             direction     TEXT,
             target        REAL NOT NULL,
+            target_upper  REAL,
+            alert_type    TEXT NOT NULL DEFAULT 'crossing',
             price_source  TEXT NOT NULL DEFAULT 'bid',
             repeat        INTEGER NOT NULL DEFAULT 0,
             enabled       INTEGER NOT NULL DEFAULT 1,
             last_side     TEXT,
+            expires_at    TEXT,
             created_at    TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
@@ -110,6 +113,17 @@ def init_db() -> None:
             (counters[row["chat_id"]], row["id"]),
         )
     if rows:
+        conn.commit()
+
+    # Migration: add target_upper, alert_type, expires_at to price_alerts
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(price_alerts)").fetchall()]
+    if "alert_type" not in cols:
+        conn.execute("ALTER TABLE price_alerts ADD COLUMN alert_type TEXT NOT NULL DEFAULT 'crossing'")
+    if "target_upper" not in cols:
+        conn.execute("ALTER TABLE price_alerts ADD COLUMN target_upper REAL")
+    if "expires_at" not in cols:
+        conn.execute("ALTER TABLE price_alerts ADD COLUMN expires_at TEXT")
+    if "alert_type" not in cols or "target_upper" not in cols or "expires_at" not in cols:
         conn.commit()
 
     # Migration: add user_seq to marks + backfill
@@ -227,6 +241,9 @@ def add_price_alert(
     symbol: str,
     target: float,
     direction: Optional[str] = None,
+    alert_type: str = "crossing",
+    target_upper: Optional[float] = None,
+    expires_at: Optional[str] = None,
 ) -> PriceAlert:
     with _tx() as conn:
         # Find smallest unused user_seq for this chat_id
@@ -239,8 +256,9 @@ def add_price_alert(
         while next_seq in used:
             next_seq += 1
         cur = conn.execute(
-            "INSERT INTO price_alerts (chat_id, user_seq, symbol, direction, target) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, next_seq, symbol, direction, target),
+            "INSERT INTO price_alerts (chat_id, user_seq, symbol, direction, target, alert_type, target_upper, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, next_seq, symbol, direction, target, alert_type, target_upper, expires_at),
         )
         row = conn.execute("SELECT * FROM price_alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _row_to_price(row)
@@ -249,12 +267,16 @@ def add_price_alert(
 def get_price_alerts(chat_id: Optional[int] = None) -> list[PriceAlert]:
     if chat_id is not None:
         rows = _conn().execute(
-            "SELECT * FROM price_alerts WHERE chat_id=? AND enabled=1 ORDER BY id",
+            "SELECT * FROM price_alerts WHERE chat_id=? AND enabled=1"
+            " AND (expires_at IS NULL OR expires_at > datetime('now'))"
+            " ORDER BY id",
             (chat_id,),
         ).fetchall()
     else:
         rows = _conn().execute(
-            "SELECT * FROM price_alerts WHERE enabled=1 ORDER BY id"
+            "SELECT * FROM price_alerts WHERE enabled=1"
+            " AND (expires_at IS NULL OR expires_at > datetime('now'))"
+            " ORDER BY id"
         ).fetchall()
     return [_row_to_price(r) for r in rows]
 
@@ -402,6 +424,7 @@ def _row_to_candle(row: sqlite3.Row) -> CandleAlert:
 
 
 def _row_to_price(row: sqlite3.Row) -> PriceAlert:
+    keys = row.keys()
     return PriceAlert(
         id=row["id"],
         chat_id=row["chat_id"],
@@ -409,10 +432,13 @@ def _row_to_price(row: sqlite3.Row) -> PriceAlert:
         symbol=row["symbol"],
         direction=row["direction"],
         target=row["target"],
+        target_upper=row["target_upper"] if "target_upper" in keys else None,
+        alert_type=row["alert_type"] if "alert_type" in keys else "crossing",
         price_source=row["price_source"],
         repeat=bool(row["repeat"]),
         enabled=bool(row["enabled"]),
         last_side=row["last_side"],
+        expires_at=row["expires_at"] if "expires_at" in keys else None,
         created_at=row["created_at"],
     )
 

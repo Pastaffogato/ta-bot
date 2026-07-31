@@ -241,10 +241,57 @@ async def _process_price_alerts(
 
         price = tick.bid
 
+        # For close-type alerts, get the previous bar's close
+        prev_close = None
+        close_alerts = [a for a in alerts if a.symbol == symbol and a.alert_type == "close"]
+        if close_alerts:
+            prev_bar = await mt5_data.previous_bar(symbol, 1)  # M1 bar for close check
+            if prev_bar:
+                prev_close = prev_bar.close
+
         for alert in alerts:
             if alert.symbol != symbol:
                 continue
 
+            if alert.alert_type == "close":
+                if prev_close is None:
+                    continue
+
+                triggered = False
+                if alert.target_upper is not None:
+                    # Range close: close must be within [target, target_upper]
+                    if alert.target <= prev_close <= alert.target_upper:
+                        triggered = True
+                else:
+                    # Single boundary: cross and close
+                    current_side = "above" if prev_close > alert.target else "below"
+                    if alert.last_side is None:
+                        db.update_price_alert(alert.id, last_side=current_side)
+                        alert.last_side = current_side
+                        continue
+                    if alert.last_side != current_side:
+                        triggered = True
+                    db.update_price_alert(alert.id, last_side=current_side)
+                    alert.last_side = current_side
+
+                if triggered:
+                    try:
+                        await send_price(
+                            chat_id=alert.chat_id,
+                            alert=alert,
+                            price=prev_close,
+                            tick=tick,
+                        )
+                    except Exception:
+                        logger.exception("Failed to send close alert to chat %d", alert.chat_id)
+
+                    if not alert.repeat:
+                        db.update_price_alert(alert.id, enabled=False)
+                        alert.enabled = False
+
+                continue  # close alerts handled, skip crossing logic
+
+            # Crossing alert logic (existing)
             current_side = "above" if price > alert.target else "below"
 
             if alert.last_side is None:

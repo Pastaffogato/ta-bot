@@ -52,6 +52,7 @@ def _err(msg: str) -> str:
 import re
 
 _EXPIRY_RE = re.compile(r'^(\d+)([smh])$', re.IGNORECASE)
+_REL_RE = re.compile(r'^([+-])(\d+(?:\.\d+)?)$')
 
 
 def _parse_expiry(arg: str) -> tuple[int, str] | None:
@@ -67,6 +68,26 @@ def _parse_expiry(arg: str) -> tuple[int, str] | None:
         return val * 60, f"{val}m"
     else:  # 'h'
         return val * 3600, f"{val}h"
+
+
+def _fmt_expiry(expires_at: str | None) -> str:
+    """Format expiry as relative time (UTC+8). Returns empty string if no expiry."""
+    if not expires_at:
+        return ""
+    try:
+        exp_dt = datetime.fromisoformat(expires_at)
+    except (ValueError, TypeError):
+        return ""
+    now = datetime.now(timezone.utc)
+    remaining = exp_dt - now
+    total_s = int(remaining.total_seconds())
+    if total_s <= 0:
+        return " (expired)"
+    if total_s < 60:
+        return f" (expires in {total_s}s)"
+    if total_s < 3600:
+        return f" (expires in {total_s // 60}m)"
+    return f" (expires in {total_s // 3600}h{total_s % 3600 // 60}m)"
 
 
 def _parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | None]:
@@ -85,6 +106,66 @@ def _parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | No
             except ValueError:
                 pass  # skip non-price, non-expiry args
     return prices, expiry_s, expiry_label
+
+
+def _resolve_price_args(
+    args: list[str],
+    current_price: float,
+    pip_size: float,
+) -> tuple[str, list[float], int | None, str | None]:
+    """Parse price alert args. Returns (alert_type, boundaries, expiry_s, expiry_label).
+    - alert_type: "crossing" or "close"
+    - boundaries: absolute prices (sorted for close, 1-2 items for close, 1+ for crossing)
+    - expiry_s, expiry_label: parsed from suffix
+    """
+    alert_type = "crossing"
+    expiry_s = None
+    expiry_label = None
+    raw_prices: list[float] = []  # parsed absolute prices (before sorting)
+    relative_pips: list[tuple[str, float]] = []  # (sign, pip_amount)
+
+    for a in args:
+        # Check for "close" keyword
+        if a.lower() == "close":
+            alert_type = "close"
+            continue
+
+        # Check for expiry suffix
+        exp = _parse_expiry(a)
+        if exp is not None:
+            expiry_s, expiry_label = exp
+            continue
+
+        # Check for relative price (+N or -N)
+        rel = _REL_RE.match(a)
+        if rel:
+            sign = rel.group(1)
+            pips = float(rel.group(2))
+            relative_pips.append((sign, pips))
+            continue
+
+        # Try absolute price
+        try:
+            raw_prices.append(float(a))
+        except ValueError:
+            pass  # skip unrecognized
+
+    # Resolve relative prices to absolute
+    boundaries = list(raw_prices)
+    for sign, pips in relative_pips:
+        offset = pips * pip_size
+        if sign == "+":
+            boundaries.append(current_price + offset)
+        else:
+            boundaries.append(current_price - offset)
+
+    # For close type: auto-sort, max 2 boundaries
+    if alert_type == "close":
+        boundaries = sorted(boundaries)
+        if len(boundaries) > 2:
+            boundaries = boundaries[:2]
+
+    return alert_type, boundaries, expiry_s, expiry_label
 
 
 # ============================================================
@@ -498,158 +579,124 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
 
     if len(args) < 1:
-        await update.message.reply_text(
-            _err("Usage: /price [SYMBOL] TARGET [ABOVE/BELOW] [TARGET ...]\n"
-                 "  /price xauusd 2400\n"
-                 "  /price 2400 (with focus pair)\n"
-                 "  /price 2400 2450 2500 (multi with focus pair)\n"
-                 "  /price xauusd above 2400")
-        )
+        await update.message.reply_text(_err(
+            "Usage:\n"
+            "/price [SYMBOL] <price> [+50] [-30] [30m|2h] [close]\n"
+            "  /price 2400 2450 2500 (multi crossing)\n"
+            "  /price +50 -30 (relative pips)\n"
+            "  /price close 2400 2450 (close range, smart-sorted)\n"
+            "  /price close 2400 (cross and close)\n"
+            "  /price 2400 30m (expires in 30 minutes)"
+        ))
         return
 
     focus = _get_focus(chat_id)
+    resolved = None
+    price_args = args
 
-    # Multi-arg with focus pair: /price 2400 2450 2500
-    if focus and len(args) >= 1:
-        try:
-            targets = [float(a) for a in args]
-        except ValueError:
-            targets = None
-        if targets:
-            tick = await mt5_data.tick(focus)
-            if tick is None:
-                await update.message.reply_text(_err(f"No tick data for {_display_symbol(focus)}"))
-                return
-            display = _display_symbol(focus)
-            lines = []
-            for target in targets:
-                price = tick.bid
-                current_side = "above" if price > target else "below"
-                alert = db.add_price_alert(chat_id, focus, target, None)
-                db.update_price_alert(alert.id, last_side=current_side)
-                lines.append(f"p{alert.user_seq} {display.upper()} crossing {target}")
-            lines.append(f"Current bid: {_fmt_ohlc(tick.bid, focus, None)}")
-            await update.message.reply_text("\n".join(["✅ Price alerts:"] + lines))
-            return
+    # Determine if first arg is a symbol (not a number, close, relative, or expiry)
+    first = args[0]
+    is_symbol = False
+    try:
+        float(first)
+    except ValueError:
+        if first.lower() != "close" and not _REL_RE.match(first) and _parse_expiry(first) is None:
+            is_symbol = True
 
-    # Non-fp multi-arg: /price XAUUSD 2400 2450 2500
-    if not focus and len(args) >= 2:
-        try:
-            targets = [float(a) for a in args[1:]]
-        except ValueError:
-            targets = None
-        if targets:
-            resolved = await mt5_data.resolve_symbol(args[0])
-            if resolved is not None:
-                tick = await mt5_data.tick(resolved)
-                if tick is None:
-                    await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
-                    return
-                display = _display_symbol(resolved)
-                lines = []
-                for target in targets:
-                    price = tick.bid
-                    current_side = "above" if price > target else "below"
-                    alert = db.add_price_alert(chat_id, resolved, target, None)
-                    db.update_price_alert(alert.id, last_side=current_side)
-                    lines.append(f"p{alert.user_seq} {display.upper()} crossing {target}")
-                lines.append(f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}")
-                await update.message.reply_text("\n".join(["✅ Price alerts:"] + lines))
-                return
-
-    direction = None
-    target = None
-    symbol = None
-
-    if len(args) == 1:
-        # /price TARGET — needs focus pair (multi-arg block handles the focus case)
-        if not focus:
-            await update.message.reply_text(
-                _err("Usage: /price [SYMBOL] TARGET\n"
-                     "Or set focus with /fp first, then /price 2600")
-            )
-            return
-        try:
-            target = float(args[0])
-        except ValueError:
-            await update.message.reply_text(_err(f"Invalid price target: {args[0]}"))
-            return
-        symbol = _display_symbol(focus)
-        resolved = focus
-
-    elif len(args) == 2:
-        if args[0].lower() in ("above", "below"):
-            # /price ABOVE/BELOW TARGET — needs focus pair
-            if not focus:
-                await update.message.reply_text(
-                    _err("Usage: /price SYMBOL ABOVE TARGET\n"
-                         "Or set focus with /fp first, then /price above 2600")
-                )
-                return
-            direction = args[0].lower()
-            try:
-                target = float(args[1])
-            except ValueError:
-                await update.message.reply_text(_err(f"Invalid price target: {args[1]}"))
-                return
-            resolved = focus
-            symbol = _display_symbol(focus)
-        else:
-            # /price SYMBOL TARGET
-            try:
-                target = float(args[1])
-            except ValueError:
-                await update.message.reply_text(_err(f"Invalid price target: {args[1]}"))
-                return
-            symbol = args[0].upper()
-            resolved = await mt5_data.resolve_symbol(symbol)
-            if resolved is None:
-                await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
-                return
-
-    else:
-        # /price SYMBOL ABOVE/BELOW TARGET
-        symbol = args[0].upper()
-        if args[1].lower() in ("above", "below"):
-            direction = args[1].lower()
-            try:
-                target = float(args[2])
-            except ValueError:
-                await update.message.reply_text(_err(f"Invalid price target: {args[2]}"))
-                return
-        else:
-            await update.message.reply_text(_err("Usage: /price SYMBOL [ABOVE/BELOW] TARGET"))
-            return
-
-        resolved = await mt5_data.resolve_symbol(symbol)
+    if is_symbol:
+        resolved = await mt5_data.resolve_symbol(first)
         if resolved is None:
-            await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
+            await update.message.reply_text(_err(f"Symbol not found: {first}"))
             return
-
-    if target is None:
-        await update.message.reply_text(_err("Missing price target"))
+        price_args = args[1:]
+    elif focus:
+        resolved = focus
+    else:
+        await update.message.reply_text(_err(
+            "Usage: /price <symbol> <price> ...\n"
+            "Or set focus with /fp first, then /price 2400"
+        ))
         return
 
+    if not price_args:
+        await update.message.reply_text(_err("No price specified"))
+        return
+
+    # Get tick data
     tick = await mt5_data.tick(resolved)
     if tick is None:
         await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
         return
 
-    price = tick.bid
-    current_side = "above" if price > target else "below"
+    sinfo = await mt5_data.symbol_info(resolved)
+    pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
 
-    alert = db.add_price_alert(chat_id, resolved, target, direction)
-    db.update_price_alert(alert.id, last_side=current_side)
-    alert.last_side = current_side
-
-    dir_str = direction if direction else "either direction"
-    display = _display_symbol(resolved)
-    await update.message.reply_text(
-        f"✅ Price alert p{alert.user_seq}\n"
-        f"{display.upper()} crossing {dir_str} {target}\n"
-        f"Current bid: {_fmt_ohlc(price, resolved, None)}\n"
-        f"/cancel p{alert.user_seq} to remove"
+    # Parse args
+    alert_type, boundaries, expiry_s, expiry_label = _resolve_price_args(
+        price_args, tick.bid, pip_size
     )
+
+    if not boundaries:
+        await update.message.reply_text(_err("No valid price specified"))
+        return
+
+    # Compute expires_at
+    from datetime import timedelta
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
+
+    display = _display_symbol(resolved)
+
+    if alert_type == "close":
+        # Close type: 1 or 2 boundaries
+        lower = boundaries[0]
+        upper = boundaries[1] if len(boundaries) > 1 else None
+
+        if upper is not None:
+            # Range close: price must close within [lower, upper]
+            alert = db.add_price_alert(
+                chat_id, resolved, lower,
+                alert_type="close", target_upper=upper, expires_at=expires_at,
+            )
+            current_side = "above" if tick.bid > upper else ("below" if tick.bid < lower else "inside")
+            db.update_price_alert(alert.id, last_side=current_side)
+            alert.last_side = current_side
+            exp_str = f" {_fmt_expiry(expires_at)}" if expires_at else ""
+            await update.message.reply_text(
+                f"✅ Close alert p{alert.user_seq}{exp_str}\n"
+                f"{display.upper()} close {lower:.2f}–{upper:.2f}\n"
+                f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}\n"
+                f"/cancel p{alert.user_seq} to remove"
+            )
+        else:
+            # Single boundary close: cross and close
+            alert = db.add_price_alert(
+                chat_id, resolved, lower,
+                alert_type="close", expires_at=expires_at,
+            )
+            current_side = "above" if tick.bid > lower else "below"
+            db.update_price_alert(alert.id, last_side=current_side)
+            alert.last_side = current_side
+            exp_str = f" {_fmt_expiry(expires_at)}" if expires_at else ""
+            await update.message.reply_text(
+                f"✅ Close alert p{alert.user_seq}{exp_str}\n"
+                f"{display.upper()} close {'above' if current_side == 'below' else 'below'} {lower:.2f}\n"
+                f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}\n"
+                f"/cancel p{alert.user_seq} to remove"
+            )
+    else:
+        # Crossing type: one alert per boundary
+        lines = []
+        for target in boundaries:
+            current_side = "above" if tick.bid > target else "below"
+            alert = db.add_price_alert(
+                chat_id, resolved, target, None,
+                alert_type="crossing", expires_at=expires_at,
+            )
+            db.update_price_alert(alert.id, last_side=current_side)
+            lines.append(f"p{alert.user_seq} {display.upper()} crossing {target}")
+        exp_str = f" (expires in {expiry_label})" if expiry_label else ""
+        lines.append(f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}")
+        await update.message.reply_text("\n".join(["✅ Price alerts:"] + lines) + exp_str)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -846,8 +893,7 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines = []
         for m in marks:
             display = _display_symbol(m.symbol)
-            exp = f" (expires {m.expires_at[:16]})" if m.expires_at else ""
-            lines.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(m.price, m.symbol)}{exp}")
+            lines.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(m.price, m.symbol)}{_fmt_expiry(m.expires_at)}")
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -993,10 +1039,18 @@ def _format_price_alert_message(
     tick: Tick,
     chat_id: int,
 ) -> str:
-    dir_str = f"crossed {alert.direction}" if alert.direction else "crossed"
     display = _display_symbol(alert.symbol)
-    return (
-        f"🔔 <b>{display.upper()}</b> {dir_str} {alert.target}!\n"
+    if alert.alert_type == "close":
+        if alert.target_upper is not None:
+            msg = (
+                f"🔔 <b>{display.upper()}</b> closed within {alert.target:.2f}–{alert.target_upper:.2f}!\n"
+            )
+        else:
+            msg = f"🔔 <b>{display.upper()}</b> closed beyond {alert.target:.2f}!\n"
+    else:
+        dir_str = f"crossed {alert.direction}" if alert.direction else "crossed"
+        msg = f"🔔 <b>{display.upper()}</b> {dir_str} {alert.target}!\n"
+    return msg + (
         f"Bid: {_fmt_ohlc(tick.bid, alert.symbol, None)}  "
         f"Ask: {_fmt_ohlc(tick.ask, alert.symbol, None)}"
     )
