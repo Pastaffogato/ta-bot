@@ -130,20 +130,26 @@ def _true_range(
     lows: np.ndarray,
     closes: np.ndarray,
 ) -> np.ndarray:
-    """Return true range aligned to source bars.
+    """Return true range aligned to source bars (MT5-compatible).
 
-    Index zero is unavailable because its previous close was not fetched.
+    MT5 defines TR for every bar. For the oldest bar (index 0) there is no
+    previous close, so TR[0] = High[0] - Low[0]. For all later bars:
+        TR[i] = max(H-L, |H - prevC|, |L - prevC|)
     """
     highs = np.asarray(highs, dtype=np.float64)
     lows = np.asarray(lows, dtype=np.float64)
     closes = np.asarray(closes, dtype=np.float64)
 
     n = len(closes)
-    tr = np.full(n, np.nan, dtype=np.float64)
+    tr = np.zeros(n, dtype=np.float64)
 
-    if n < 2:
+    if n == 0:
+        return tr
+    if n == 1:
+        tr[0] = highs[0] - lows[0]
         return tr
 
+    tr[0] = highs[0] - lows[0]
     tr[1:] = np.maximum.reduce(
         (
             highs[1:] - lows[1:],
@@ -175,8 +181,14 @@ def _rolling_atr(
 ) -> list[float]:
     """Return MT5-compatible ATR values using Wilder smoothing.
 
-    Input arrays must be chronological. The first ATR requires period + 1
-    bars because the first fetched bar has no preceding close.
+    Matches MT5 iATR():
+        TR[0]     = High[0] - Low[0]   (oldest bar has no previous close)
+        TR[i>0]   = max(H-L, |H-prevC|, |L-prevC|)
+        ATR seed  = SMA(TR[0 .. period-1])   at bar index period-1
+        ATR[i]    = (ATR[i-1] * (period-1) + TR[i]) / period   (Wilder)
+
+    Input arrays must be chronological (index 0 = oldest bar).
+    Returns one ATR value per bar from index `period-1` onward.
     """
     if period <= 0:
         raise ValueError(
@@ -189,19 +201,16 @@ def _rolling_atr(
         closes,
     )
 
-    # Remove the unavailable value at source index zero.
-    valid_tr = tr[1:]
-
-    if len(valid_tr) < period:
+    if len(tr) <= period:
         return []
 
     atr_values = [
-        float(np.mean(valid_tr[:period]))
+        float(np.mean(tr[:period]))
     ]
 
-    for i in range(period, len(valid_tr)):
+    for i in range(period, len(tr)):
         previous_atr = atr_values[-1]
-        current_tr = float(valid_tr[i])
+        current_tr = float(tr[i])
 
         atr_value = (
             previous_atr * (period - 1)
