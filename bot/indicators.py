@@ -261,10 +261,14 @@ def _adx(
 ]:
     """Return MT5 standard ADX, +DI, and -DI.
 
-    This targets MT5 iADX(), not iADXWilder().
+    This targets MT5 iADX() (standard), which uses Wilder smoothing
+    (smoothing factor = 1/period) for TR, +DM, -DM, and DX→ADX.
+    This is NOT iADXWilder() — both iADX() and iADXWilder() use Wilder
+    smoothing; they differ only in DI calculation details.
 
-    MT5 standard ADX uses exponential smoothing:
-        alpha = 2 / (period + 1)
+    Wilder smoothing: alpha = 1 / period
+        new = prev * (1 - alpha) + cur * alpha
+            = prev * (period-1)/period + cur/period
 
     Input arrays must be chronological:
         index 0  = oldest bar
@@ -328,9 +332,9 @@ def _adx(
         ):
             minus_dm[i] = down_move
 
-    alpha = 2.0 / (period + 1.0)
+    alpha = 1.0 / period  # Wilder smoothing factor (MT5 iADX standard)
 
-    # Seed EMA components with the SMA of the first `period`
+    # Seed Wilder-smoothed components with the SMA of the first `period`
     # valid observations: source indices 1 through period.
     smoothed_tr = float(
         np.mean(tr[1 : period + 1])
@@ -417,7 +421,7 @@ def _adx(
             minus_di_latest,
         )
 
-    # MT5 standard ADX applies EMA smoothing to DX.
+    # MT5 standard ADX applies Wilder smoothing to DX.
     adx_value = float(
         np.mean(dx_values[:period])
     )
