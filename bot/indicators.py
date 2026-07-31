@@ -125,15 +125,33 @@ def _ema(data: np.ndarray, period: int) -> float:
     return float(result)
 
 
-def _true_range(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> np.ndarray:
-    """True range array: max(high-low, |high-prev_close|, |low-prev_close|)."""
-    tr = np.zeros(len(highs), dtype=np.float64)
-    tr[0] = highs[0] - lows[0]
-    for i in range(1, len(highs)):
-        hl = highs[i] - lows[i]
-        hc = abs(highs[i] - closes[i - 1])
-        lc = abs(lows[i] - closes[i - 1])
-        tr[i] = max(hl, hc, lc)
+def _true_range(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+) -> np.ndarray:
+    """Return true range aligned to source bars.
+
+    Index zero is unavailable because its previous close was not fetched.
+    """
+    highs = np.asarray(highs, dtype=np.float64)
+    lows = np.asarray(lows, dtype=np.float64)
+    closes = np.asarray(closes, dtype=np.float64)
+
+    n = len(closes)
+    tr = np.full(n, np.nan, dtype=np.float64)
+
+    if n < 2:
+        return tr
+
+    tr[1:] = np.maximum.reduce(
+        (
+            highs[1:] - lows[1:],
+            np.abs(highs[1:] - closes[:-1]),
+            np.abs(lows[1:] - closes[:-1]),
+        )
+    )
+
     return tr
 
 
@@ -149,10 +167,52 @@ def _smooth_wilder(values: np.ndarray, period: int) -> list[float]:
     return result
 
 
-def _rolling_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> list[float]:
-    """Compute rolling ATR values (Wilder's smoothing). Returns list of ATR values."""
-    tr = _true_range(highs, lows, closes)
-    return _smooth_wilder(tr, period)
+def _rolling_atr(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int,
+) -> list[float]:
+    """Return MT5-compatible ATR values using Wilder smoothing.
+
+    Input arrays must be chronological. The first ATR requires period + 1
+    bars because the first fetched bar has no preceding close.
+    """
+    if period <= 0:
+        raise ValueError(
+            "period must be greater than zero"
+        )
+
+    tr = _true_range(
+        highs,
+        lows,
+        closes,
+    )
+
+    # Remove the unavailable value at source index zero.
+    valid_tr = tr[1:]
+
+    if len(valid_tr) < period:
+        return []
+
+    atr_values = [
+        float(np.mean(valid_tr[:period]))
+    ]
+
+    for i in range(period, len(valid_tr)):
+        previous_atr = atr_values[-1]
+        current_tr = float(valid_tr[i])
+
+        atr_value = (
+            previous_atr * (period - 1)
+            + current_tr
+        ) / period
+
+        atr_values.append(
+            float(atr_value)
+        )
+
+    return atr_values
 
 
 def _rolling_rsi(closes: np.ndarray, period: int) -> list[float]:
@@ -189,66 +249,190 @@ def _rsi_from_avgs(avg_gain: float, avg_loss: float) -> float:
     return float(100.0 - 100.0 / (1.0 + rs))
 
 
-def _adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14):
-    """Compute ADX(period) with +DI and -DI using Wilder's smoothing.
+def _adx(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+) -> tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
+    """Return MT5 standard ADX, +DI, and -DI.
 
-    Returns (adx, di_plus, di_minus) — the latest values.
+    This targets MT5 iADX(), not iADXWilder().
+
+    MT5 standard ADX uses exponential smoothing:
+        alpha = 2 / (period + 1)
+
+    Input arrays must be chronological:
+        index 0  = oldest bar
+        index -1 = newest selected bar
+
+    Returns:
+        (latest_adx, latest_plus_di, latest_minus_di)
     """
-    n = len(highs)
+    highs = np.asarray(highs, dtype=np.float64)
+    lows = np.asarray(lows, dtype=np.float64)
+    closes = np.asarray(closes, dtype=np.float64)
 
-    # True Range
-    tr = _true_range(highs, lows, closes)
+    n = len(closes)
 
-    # +DM and -DM
+    if period <= 0:
+        raise ValueError("period must be greater than zero")
+
+    if not (
+        len(highs) == n
+        and len(lows) == n
+    ):
+        raise ValueError(
+            "highs, lows, and closes must have equal lengths"
+        )
+
+    if n < period + 1:
+        return None, None, None
+
+    # Bar-aligned source arrays. Index zero has no previous bar.
+    tr = np.zeros(n, dtype=np.float64)
     plus_dm = np.zeros(n, dtype=np.float64)
     minus_dm = np.zeros(n, dtype=np.float64)
+
     for i in range(1, n):
-        up = highs[i] - highs[i - 1]
-        down = lows[i - 1] - lows[i]
-        if up > down and up > 0:
-            plus_dm[i] = up
-        if down > up and down > 0:
-            minus_dm[i] = down
+        high_low = highs[i] - lows[i]
+        high_previous_close = abs(
+            highs[i] - closes[i - 1]
+        )
+        low_previous_close = abs(
+            lows[i] - closes[i - 1]
+        )
 
-    # Wilder's smoothing for TR, +DM, -DM
-    tr_smooth = _smooth_wilder(tr, period)
-    pdm_smooth = _smooth_wilder(plus_dm, period)
-    mdm_smooth = _smooth_wilder(minus_dm, period)
+        tr[i] = max(
+            high_low,
+            high_previous_close,
+            low_previous_close,
+        )
 
-    if not tr_smooth:
-        return 0.0, 0.0, 0.0
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
 
-    # Compute +DI, -DI, and DX for each smoothed step
-    dx_vals = []
-    di_plus_last = 0.0
-    di_minus_last = 0.0
+        if (
+            up_move > down_move
+            and up_move > 0.0
+        ):
+            plus_dm[i] = up_move
 
-    for i in range(len(tr_smooth)):
-        if tr_smooth[i] > 0:
-            di_p = 100.0 * pdm_smooth[i] / tr_smooth[i]
-            di_m = 100.0 * mdm_smooth[i] / tr_smooth[i]
+        if (
+            down_move > up_move
+            and down_move > 0.0
+        ):
+            minus_dm[i] = down_move
+
+    alpha = 2.0 / (period + 1.0)
+
+    # Seed EMA components with the SMA of the first `period`
+    # valid observations: source indices 1 through period.
+    smoothed_tr = float(
+        np.mean(tr[1 : period + 1])
+    )
+    smoothed_plus_dm = float(
+        np.mean(plus_dm[1 : period + 1])
+    )
+    smoothed_minus_dm = float(
+        np.mean(minus_dm[1 : period + 1])
+    )
+
+    def calculate_di_and_dx() -> tuple[
+        float,
+        float,
+        float,
+    ]:
+        if smoothed_tr > 0.0:
+            plus_di = (
+                100.0
+                * smoothed_plus_dm
+                / smoothed_tr
+            )
+            minus_di = (
+                100.0
+                * smoothed_minus_dm
+                / smoothed_tr
+            )
         else:
-            di_p = 0.0
-            di_m = 0.0
+            plus_di = 0.0
+            minus_di = 0.0
 
-        di_plus_last = di_p
-        di_minus_last = di_m
+        di_sum = plus_di + minus_di
 
-        di_sum = di_p + di_m
-        if di_sum > 0:
-            dx = 100.0 * abs(di_p - di_m) / di_sum
+        if di_sum > 0.0:
+            dx = (
+                100.0
+                * abs(plus_di - minus_di)
+                / di_sum
+            )
         else:
             dx = 0.0
-        dx_vals.append(dx)
 
-    # Smooth DX to get ADX (Wilder's smoothing)
-    if len(dx_vals) < period:
-        return float(dx_vals[-1]) if dx_vals else 0.0, di_plus_last, di_minus_last
+        return (
+            float(plus_di),
+            float(minus_di),
+            float(dx),
+        )
 
-    adx_smooth = _smooth_wilder(np.array(dx_vals, dtype=np.float64), period)
-    adx_val = adx_smooth[-1] if adx_smooth else (dx_vals[-1] if dx_vals else 0.0)
+    plus_di_latest, minus_di_latest, first_dx = (
+        calculate_di_and_dx()
+    )
 
-    return float(adx_val), float(di_plus_last), float(di_minus_last)
+    dx_values = [first_dx]
+
+    # Continue EMA smoothing from source index period + 1.
+    for i in range(period + 1, n):
+        smoothed_tr = (
+            alpha * tr[i]
+            + (1.0 - alpha) * smoothed_tr
+        )
+
+        smoothed_plus_dm = (
+            alpha * plus_dm[i]
+            + (1.0 - alpha) * smoothed_plus_dm
+        )
+
+        smoothed_minus_dm = (
+            alpha * minus_dm[i]
+            + (1.0 - alpha) * smoothed_minus_dm
+        )
+
+        (
+            plus_di_latest,
+            minus_di_latest,
+            dx,
+        ) = calculate_di_and_dx()
+
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return (
+            None,
+            plus_di_latest,
+            minus_di_latest,
+        )
+
+    # MT5 standard ADX applies EMA smoothing to DX.
+    adx_value = float(
+        np.mean(dx_values[:period])
+    )
+
+    for i in range(period, len(dx_values)):
+        adx_value = (
+            alpha * dx_values[i]
+            + (1.0 - alpha) * adx_value
+        )
+
+    return (
+        float(adx_value),
+        float(plus_di_latest),
+        float(minus_di_latest),
+    )
 
 
 # ── formatting ──

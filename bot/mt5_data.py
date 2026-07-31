@@ -218,18 +218,43 @@ async def today_open_bar(symbol: str) -> Optional[Bar]:
     return _bar_from_row(bars[0], symbol, 1440)
 
 
-async def bars_n(symbol: str, timeframe_min: int, count: int) -> list[Bar]:
-    """Fetch the last N bars (0=current, 1=prev, ..., N-1=oldest).
+async def bars_n(symbol: str,timeframe_min: int,count: int) -> list[Bar]:
+    """Fetch the last N bars and return them newest-first.
 
-    Returns bars newest-first. An empty list means no data available.
+    Return order:
+        result[0] = current incomplete bar
+        result[1] = previous completed bar
+        result[-1] = oldest requested bar
+
+    An empty list means no data is available.
     """
     tf = _mt5_timeframe(timeframe_min)
-    if tf is None:
+
+    if tf is None or count <= 0:
         return []
-    bars = await _call_mt5(mt5.copy_rates_from_pos, symbol, tf, 0, count)
-    if bars is None or len(bars) == 0:
+
+    rates = await _call_mt5(
+        mt5.copy_rates_from_pos,
+        symbol,
+        tf,
+        0,
+        count,
+    )
+
+    if rates is None or len(rates) == 0:
         return []
-    return [_bar_from_row(b, symbol, timeframe_min) for b in bars]
+
+    result = [
+        _bar_from_row(row, symbol, timeframe_min)
+        for row in rates
+    ]
+
+    # MT5 returns the copied block in chronological order:
+    # oldest first and current/newest last.
+    result.reverse()
+
+    return result
+
 
 
 # ---- internal helpers ----

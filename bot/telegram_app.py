@@ -1119,7 +1119,7 @@ async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     sinfo = await mt5_data.symbol_info(symbol)
 
-    bars = await mt5_data.bars_n(symbol, tf_min, 52)
+    bars = await mt5_data.bars_n(symbol, tf_min, 500)
     if not bars:
         await update.message.reply_text(_err("No bar data available"))
         return

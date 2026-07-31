@@ -196,10 +196,10 @@ async def _send_group(
 
         sinfo = await mt5_data.symbol_info(symbol)
 
-        # ── indicator computation (fetch 52 bars, skip current for completed candle) ──
+        # ── indicator computation (fetch 500 bars, skip current for completed candle) ──
         ind_snap = None
         try:
-            bars = await mt5_data.bars_n(symbol, tf_min, 52)
+            bars = await mt5_data.bars_n(symbol, tf_min, 500)  # uses 500, since RSI and EMA uses a lot of candle despite the low period number
             if bars:
                 ind_snap = indicators.compute_all(bars, skip_current=True)
         except Exception:
