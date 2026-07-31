@@ -798,6 +798,175 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Nothing to clear")
 
 
+async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open a paper trade. /entry [SYMBOL] LONG|SHORT [entry] [sl X] [tp Y]"""
+    chat_id = update.effective_chat.id
+    db.ensure_user(chat_id)
+    args = context.args or []
+
+    if len(args) < 1:
+        await update.message.reply_text(_err(
+            "Usage:\n"
+            "/entry [SYMBOL] LONG|SHORT [entry] [sl X] [tp Y]\n"
+            "  /entry xauusd long (market)\n"
+            "  /entry xauusd short 2400 sl 2410 tp 2380\n"
+            "  /entry long sl -30 tp +50 (relative pips)"
+        ))
+        return
+
+    focus = _get_focus(chat_id)
+    resolved = None
+    trade_args = args
+
+    # First arg: symbol or direction
+    first = args[0].lower()
+    if first in ("long", "short"):
+        if not focus:
+            await update.message.reply_text(_err("Usage: /entry SYMBOL LONG|SHORT ...\nOr set focus with /fp first"))
+            return
+        resolved = focus
+        direction = first
+        trade_args = args[1:]
+    else:
+        resolved = await mt5_data.resolve_symbol(first)
+        if resolved is None:
+            await update.message.reply_text(_err(f"Symbol not found: {first}"))
+            return
+        if len(args) < 2 or args[1].lower() not in ("long", "short"):
+            await update.message.reply_text(_err("Usage: /entry SYMBOL LONG|SHORT ..."))
+            return
+        direction = args[1].lower()
+        trade_args = args[2:]
+
+    # Get current price
+    tick = await mt5_data.tick(resolved)
+    if tick is None:
+        await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
+        return
+
+    sinfo = await mt5_data.symbol_info(resolved)
+    pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+
+    # Parse remaining args: [entry_price] [sl X] [tp Y]
+    entry_price = tick.bid if direction == "long" else tick.ask
+    stop_loss = None
+    take_profit = None
+
+    i = 0
+    while i < len(trade_args):
+        a = trade_args[i].lower()
+        if a == "sl" and i + 1 < len(trade_args):
+            sl_val = trade_args[i + 1]
+            stop_loss = _resolve_relative_price(sl_val, entry_price, pip_size)
+            i += 2
+        elif a == "tp" and i + 1 < len(trade_args):
+            tp_val = trade_args[i + 1]
+            take_profit = _resolve_relative_price(tp_val, entry_price, pip_size)
+            i += 2
+        else:
+            # Try as entry price
+            entry_price = _resolve_relative_price(a, entry_price, pip_size)
+            i += 1
+
+    trade = db.add_paper_trade(chat_id, resolved, direction, entry_price, stop_loss, take_profit)
+    display = _display_symbol(resolved)
+    lines = [
+        f"📊 t{trade.user_seq} {display.upper()} {direction.upper()} @ {_fmt_price(entry_price, resolved)}",
+    ]
+    if stop_loss:
+        lines.append(f"  SL: {_fmt_price(stop_loss, resolved)}")
+    if take_profit:
+        lines.append(f"  TP: {_fmt_price(take_profit, resolved)}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Modify or close a paper trade. /modify <id> [sl X] [tp Y] [close]"""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if len(args) < 2:
+        await update.message.reply_text(_err(
+            "Usage:\n"
+            "/modify t1 sl 2390 (move stop loss)\n"
+            "/modify t1 tp 2420 (move take profit)\n"
+            "/modify t1 sl +30 tp -20 (relative pips)\n"
+            "/modify t1 close (close at market)"
+        ))
+        return
+
+    # Parse trade ID
+    tid = args[0].lower()
+    if tid.startswith("t"):
+        tid = tid[1:]
+    try:
+        user_seq = int(tid)
+    except ValueError:
+        await update.message.reply_text(_err(f"Invalid trade ID: {args[0]}"))
+        return
+
+    trade = db.get_paper_trade_by_user_seq(chat_id, user_seq)
+    if trade is None:
+        await update.message.reply_text(_err(f"Trade t{user_seq} not found"))
+        return
+
+    # Get tick for current price
+    tick = await mt5_data.tick(trade.symbol)
+    if tick is None:
+        await update.message.reply_text(_err(f"No tick data for {_display_symbol(trade.symbol)}"))
+        return
+
+    sinfo = await mt5_data.symbol_info(trade.symbol)
+    pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+
+    mod_args = args[1:]
+    i = 0
+    while i < len(mod_args):
+        a = mod_args[i].lower()
+        if a == "sl" and i + 1 < len(mod_args):
+            sl_val = mod_args[i + 1]
+            new_sl = _resolve_relative_price(sl_val, trade.entry_price, pip_size)
+            db.update_paper_trade(trade.id, stop_loss=new_sl)
+            trade.stop_loss = new_sl
+            await update.message.reply_text(f"✅ t{user_seq} SL → {_fmt_price(new_sl, trade.symbol)}")
+            i += 2
+        elif a == "tp" and i + 1 < len(mod_args):
+            tp_val = mod_args[i + 1]
+            new_tp = _resolve_relative_price(tp_val, trade.entry_price, pip_size)
+            db.update_paper_trade(trade.id, take_profit=new_tp)
+            trade.take_profit = new_tp
+            await update.message.reply_text(f"✅ t{user_seq} TP → {_fmt_price(new_tp, trade.symbol)}")
+            i += 2
+        elif a == "close":
+            exit_price = tick.bid if trade.direction == "long" else tick.ask
+            if trade.direction == "long":
+                pnl = (exit_price - trade.entry_price) / pip_size
+            else:
+                pnl = (trade.entry_price - exit_price) / pip_size
+            db.close_paper_trade(trade.id, exit_price, pnl)
+            await update.message.reply_text(
+                f"🔒 t{user_seq} closed @ {_fmt_price(exit_price, trade.symbol)}\n"
+                f"P&L: {pnl:+.1f} pips"
+            )
+            i += 1
+        else:
+            i += 1  # skip unknown
+
+
+def _resolve_relative_price(val: str, base_price: float, pip_size: float) -> float:
+    """Parse a price value — absolute or relative (+/- pips)."""
+    rel = _REL_RE.match(val)
+    if rel:
+        sign = rel.group(1)
+        pips = float(rel.group(2))
+        offset = pips * pip_size
+        return base_price + offset if sign == "+" else base_price - offset
+    try:
+        return float(val)
+    except ValueError:
+        return base_price  # fallback
+
+
 async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Toggle which data sections appear in candle alerts."""
     chat_id = update.effective_chat.id
@@ -1196,6 +1365,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("mkd", cmd_mark_del))
     app.add_handler(CommandHandler("mkl", cmd_mark_list))
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("modify", cmd_modify))
+    app.add_handler(CommandHandler("e", cmd_entry))
+    app.add_handler(CommandHandler("m", cmd_modify))
 
     # Populate dot-prefix dispatch table
     _COMMANDS.update({
@@ -1214,6 +1387,8 @@ def build_app() -> Application:
         "mark": cmd_mark, "mk": cmd_mark,
         "mkd": cmd_mark_del, "mkl": cmd_mark_list,
         "clear": cmd_clear,
+        "entry": cmd_entry, "e": cmd_entry,
+        "modify": cmd_modify, "m": cmd_modify,
     })
 
     # Dot-prefix MessageHandler (e.g. ".add xauusd 5")

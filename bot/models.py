@@ -57,3 +57,21 @@ class Mark:
     created_at: str = ""
     expires_at: Optional[str] = None  # ISO timestamp, None = GTC
     label: str = ""  # optional user note
+
+
+@dataclass
+class PaperTrade:
+    id: int = 0
+    chat_id: int = 0
+    user_seq: int = 0  # per-user sequence number (1, 2, 3…)
+    symbol: str = ""
+    direction: str = ""  # "long" or "short"
+    entry_price: float = 0.0
+    position_size: float = 1.0
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    status: str = "open"  # "open" or "closed"
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
+    opened_at: str = ""
+    closed_at: Optional[str] = None

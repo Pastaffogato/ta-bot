@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bot.config import DB_PATH
-from bot.models import CandleAlert, CandleDelivery, Mark, PriceAlert, User
+from bot.models import CandleAlert, CandleDelivery, Mark, PaperTrade, PriceAlert, User
 
 _conn_local = threading.local()
 
@@ -91,6 +91,23 @@ def init_db() -> None:
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             expires_at TEXT,
             label      TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL REFERENCES users(chat_id),
+            user_seq      INTEGER NOT NULL DEFAULT 0,
+            symbol        TEXT NOT NULL,
+            direction     TEXT NOT NULL,
+            entry_price   REAL NOT NULL,
+            position_size REAL NOT NULL DEFAULT 1.0,
+            stop_loss     REAL,
+            take_profit   REAL,
+            status        TEXT NOT NULL DEFAULT 'open',
+            exit_price    REAL,
+            pnl           REAL,
+            opened_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            closed_at     TEXT
         );
     """)
     conn.commit()
@@ -401,6 +418,75 @@ def get_mark_by_user_seq(chat_id: int, user_seq: int) -> Optional[Mark]:
     return _row_to_mark(row) if row else None
 
 
+# ---- paper trades ----
+
+
+def add_paper_trade(
+    chat_id: int,
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+) -> PaperTrade:
+    with _tx() as conn:
+        rows = conn.execute(
+            "SELECT user_seq FROM paper_trades WHERE chat_id = ? AND status = 'open' ORDER BY user_seq",
+            (chat_id,),
+        ).fetchall()
+        used = {r[0] for r in rows}
+        next_seq = 1
+        while next_seq in used:
+            next_seq += 1
+        cur = conn.execute(
+            "INSERT INTO paper_trades (chat_id, user_seq, symbol, direction, entry_price, stop_loss, take_profit)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, next_seq, symbol, direction, entry_price, stop_loss, take_profit),
+        )
+        row = conn.execute("SELECT * FROM paper_trades WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_trade(row)
+
+
+def get_paper_trades(chat_id: int, status: Optional[str] = "open") -> list[PaperTrade]:
+    if status:
+        rows = _conn().execute(
+            "SELECT * FROM paper_trades WHERE chat_id = ? AND status = ? ORDER BY user_seq",
+            (chat_id, status),
+        ).fetchall()
+    else:
+        rows = _conn().execute(
+            "SELECT * FROM paper_trades WHERE chat_id = ? ORDER BY user_seq",
+            (chat_id,),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_paper_trade_by_user_seq(chat_id: int, user_seq: int) -> Optional[PaperTrade]:
+    row = _conn().execute(
+        "SELECT * FROM paper_trades WHERE chat_id = ? AND user_seq = ? AND status = 'open'",
+        (chat_id, user_seq),
+    ).fetchone()
+    return _row_to_trade(row) if row else None
+
+
+def update_paper_trade(trade_id: int, **kwargs) -> None:
+    if not kwargs:
+        return
+    columns = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [trade_id]
+    with _tx() as conn:
+        conn.execute(f"UPDATE paper_trades SET {columns} WHERE id = ?", values)
+
+
+def close_paper_trade(trade_id: int, exit_price: float, pnl: float) -> None:
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET status = 'closed', exit_price = ?, pnl = ?, closed_at = datetime('now')"
+            " WHERE id = ?",
+            (exit_price, pnl, trade_id),
+        )
+
+
 # ---- row converters ----
 
 def _row_to_user(row: sqlite3.Row) -> User:
@@ -453,4 +539,24 @@ def _row_to_mark(row: sqlite3.Row) -> Mark:
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         label=row["label"],
+    )
+
+
+def _row_to_trade(row: sqlite3.Row) -> PaperTrade:
+    keys = row.keys()
+    return PaperTrade(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        user_seq=row["user_seq"],
+        symbol=row["symbol"],
+        direction=row["direction"],
+        entry_price=row["entry_price"],
+        position_size=row["position_size"],
+        stop_loss=row["stop_loss"] if row["stop_loss"] is not None else None,
+        take_profit=row["take_profit"] if row["take_profit"] is not None else None,
+        status=row["status"],
+        exit_price=row["exit_price"],
+        pnl=row["pnl"],
+        opened_at=row["opened_at"],
+        closed_at=row["closed_at"],
     )
