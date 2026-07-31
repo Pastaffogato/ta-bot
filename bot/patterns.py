@@ -32,8 +32,9 @@ def classify(bar: Bar, prev_bar: Optional[Bar] = None) -> Pattern:
     direction = "bullish" if c > o else "bearish"
 
     # Engulfing: current close engulfs previous open of opposite direction.
+    # Require meaningful body (> 5% of range) — dojis can't engulf.
     # Ignore open vs previous close — spread makes that unreliable.
-    if prev_bar and prev_bar.high > prev_bar.low:
+    if body_ratio >= 0.05 and prev_bar and prev_bar.high > prev_bar.low:
         prev_dir = "bullish" if prev_bar.close > prev_bar.open else "bearish"
         # Bearish engulfing: current bearish, previous bullish, close < previous open
         if direction == "bearish" and prev_dir == "bullish":

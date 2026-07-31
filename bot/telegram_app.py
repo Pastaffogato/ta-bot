@@ -11,7 +11,7 @@ from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from bot import config, db, mt5_data, patterns, scheduler
 from bot.models import CandleAlert, PriceAlert
@@ -599,6 +599,126 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle which data sections appear in candle alerts."""
+    chat_id = update.effective_chat.id
+    db.ensure_user(chat_id)
+    args = context.args
+
+    VALID_PREFS = {"show_pattern", "show_ohlc", "show_range_body", "show_bid_ask", "show_marks"}
+
+    if not args:
+        prefs = db.get_user_prefs(chat_id)
+        lines = [f"{k}: {prefs.get(k, 'on')}" for k in sorted(VALID_PREFS)]
+        await update.message.reply_text("\n".join(lines) or "all on (default)")
+        return
+
+    if args[0].lower() == "list":
+        prefs = db.get_user_prefs(chat_id)
+        lines = [f"{k}: {prefs.get(k, 'on')}" for k in sorted(VALID_PREFS)]
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if len(args) >= 2:
+        action = args[0].lower()
+        key = args[1].lower()
+        if key not in VALID_PREFS:
+            await update.message.reply_text(
+                _err(f"Unknown section: {key}\nOptions: {', '.join(sorted(VALID_PREFS))}")
+            )
+            return
+        if action not in ("on", "off"):
+            await update.message.reply_text(_err("Use: /data on|off <section>"))
+            return
+        db.set_user_pref(chat_id, key, action)
+        await update.message.reply_text(f"✅ {key} = {action}")
+    else:
+        await update.message.reply_text(_err("Use: /data on|off <section>  or  /data list"))
+
+
+async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark a price level, show distance in candle alerts."""
+    chat_id = update.effective_chat.id
+    db.ensure_user(chat_id)
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(_err(
+            "Usage:\n"
+            "/mark <symbol> <price> [expire_min]\n"
+            "/mark del <id>\n"
+            "/mark list [symbol]"
+        ))
+        return
+
+    if args[0].lower() == "del":
+        if len(args) < 2:
+            await update.message.reply_text(_err("Usage: /mark del <id>"))
+            return
+        try:
+            mark_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text(_err(f"Invalid mark ID: {args[1]}"))
+            return
+        if db.delete_mark(mark_id, chat_id):
+            await update.message.reply_text(f"🗑️ Mark {mark_id} deleted")
+        else:
+            await update.message.reply_text(_err(f"Mark {mark_id} not found"))
+        return
+
+    if args[0].lower() == "list":
+        symbol = args[1] if len(args) > 1 else None
+        if symbol:
+            resolved = await mt5_data.resolve_symbol(symbol)
+            if resolved is None:
+                await update.message.reply_text(_err(f"Symbol not found: {symbol}"))
+                return
+            symbol = resolved
+        marks = db.get_marks(chat_id, symbol)
+        if not marks:
+            await update.message.reply_text("No active marks")
+            return
+        lines = []
+        for m in marks:
+            display = _display_symbol(m.symbol)
+            exp = f" (expires {m.expires_at[:16]})" if m.expires_at else ""
+            lines.append(f"M{m.id}: {display.upper()} {_fmt_price(m.price, m.symbol)}{exp}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # Add mark: /mark <symbol> <price> [expire_min]
+    symbol = args[0]
+    resolved = await mt5_data.resolve_symbol(symbol)
+    if resolved is None:
+        await update.message.reply_text(_err(f"Symbol not found: {symbol}"))
+        return
+    symbol = resolved
+
+    try:
+        price = float(args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]"))
+        return
+
+    expires_at = None
+    if len(args) >= 3:
+        try:
+            expire_min = int(args[2])
+            if expire_min > 0:
+                from datetime import timedelta
+                expires_at = (datetime.now(timezone.utc) + timedelta(minutes=expire_min)).isoformat()
+        except ValueError:
+            await update.message.reply_text(_err(f"Invalid expiration: {args[2]}"))
+            return
+
+    mark = db.add_mark(chat_id, symbol, price, expires_at)
+    display = _display_symbol(symbol)
+    exp_str = f" (expires in {args[2]}min)" if len(args) >= 3 else ""
+    await update.message.reply_text(
+        f"📍 M{mark.id}: {display.upper()} {_fmt_price(price, symbol)}{exp_str}"
+    )
+
+
 # ============================================================
 # Message formatting
 # ============================================================
@@ -616,6 +736,7 @@ def _format_candle_message(
 ) -> str:
     """Build the candle alert message."""
     display = _display_symbol(symbol) if symbol else "timer"
+    prefs = db.get_user_prefs(chat_id)
 
     pat = patterns.classify(bar, prev_bar) if bar else None
 
@@ -634,26 +755,46 @@ def _format_candle_message(
 
     if bar:
         # Pattern
-        lines.append(f"{pat.label}")
+        if prefs.get("show_pattern", "on") != "off" and pat:
+            lines.append(f"{pat.label}")
         # OHLC
-        lines.append(
-            f"O {_fmt_ohlc(bar.open, symbol, sinfo)}  "
-            f"H {_fmt_ohlc(bar.high, symbol, sinfo)}  "
-            f"L {_fmt_ohlc(bar.low, symbol, sinfo)}  "
-            f"C {_fmt_ohlc(bar.close, symbol, sinfo)}"
-        )
-        # Range + Body
-        range_p = bar.high - bar.low
-        body_p = abs(bar.close - bar.open)
-        lines.append(f"Range {_fmt_ohlc(range_p, symbol, sinfo)}  Body {_fmt_ohlc(body_p, symbol, sinfo)}")
+        if prefs.get("show_ohlc", "on") != "off":
+            lines.append(
+                f"O {_fmt_ohlc(bar.open, symbol, sinfo)}  "
+                f"H {_fmt_ohlc(bar.high, symbol, sinfo)}  "
+                f"L {_fmt_ohlc(bar.low, symbol, sinfo)}  "
+                f"C {_fmt_ohlc(bar.close, symbol, sinfo)}"
+            )
+        # Range + Body + Wicks
+        if prefs.get("show_range_body", "on") != "off":
+            range_p = bar.high - bar.low
+            body_p = abs(bar.close - bar.open)
+            tw = bar.high - max(bar.open, bar.close)
+            bw = min(bar.open, bar.close) - bar.low
+            lines.append(
+                f"Range {_fmt_ohlc(range_p, symbol, sinfo)}  "
+                f"Body {_fmt_ohlc(body_p, symbol, sinfo)}  "
+                f"TW {_fmt_ohlc(tw, symbol, sinfo)}  "
+                f"BW {_fmt_ohlc(bw, symbol, sinfo)}"
+            )
 
-    if tick:
+    if tick and prefs.get("show_bid_ask", "on") != "off":
         spread = tick.spread
         lines.append(
             f"Bid {_fmt_ohlc(tick.bid, symbol, sinfo)}  "
             f"Ask {_fmt_ohlc(tick.ask, symbol, sinfo)}  "
             f"Spread {_fmt_spread(spread, sinfo)}"
         )
+
+    # Marks — show distance from current price
+    if tick and sinfo and symbol and prefs.get("show_marks", "on") != "off":
+        marks = db.get_marks(chat_id, symbol)
+        if marks:
+            pip_size = sinfo.point * 10 if sinfo.point > 0 else 0.01
+            for m in marks:
+                dist_pips = (tick.bid - m.price) / pip_size
+                sign = "+" if dist_pips >= 0 else ""
+                lines.append(f"📍 M{m.id} {_fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
 
     return "\n".join(lines)
 
@@ -754,6 +895,25 @@ async def _send_error(chat_id: int, msg: str) -> None:
 # ---- app reference for scheduler callbacks ----
 _app_ref: "Application | None" = None
 
+# Command dispatch table for dot-prefix MessageHandler
+_COMMANDS: dict[str, callable] = {}
+
+
+async def _handle_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle .command messages — strip dot, parse, dispatch to existing handlers."""
+    text = update.message.text.strip()
+    if not text.startswith("."):
+        return
+    parts = text[1:].split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    handler = _COMMANDS.get(cmd)
+    if handler is None:
+        return  # silently ignore unknown dot commands
+    context.args = parts[1:]
+    await handler(update, context)
+
 
 def build_app() -> Application:
     """Build and configure the PTB Application."""
@@ -787,6 +947,32 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("p", cmd_price))
     app.add_handler(CommandHandler("c", cmd_cancel))
     app.add_handler(CommandHandler("s", cmd_status))
+    app.add_handler(CommandHandler("data", cmd_data))
+    app.add_handler(CommandHandler("dt", cmd_data))
+    app.add_handler(CommandHandler("mark", cmd_mark))
+    app.add_handler(CommandHandler("mk", cmd_mark))
+
+    # Populate dot-prefix dispatch table
+    _COMMANDS.update({
+        "help": cmd_help,
+        "focus_pair": cmd_focus_pair, "fp": cmd_focus_pair,
+        "add": cmd_add, "a": cmd_add,
+        "del": cmd_del, "d": cmd_del,
+        "list": cmd_list, "l": cmd_list,
+        "offset": cmd_offset, "o": cmd_offset,
+        "now": cmd_now, "n": cmd_now,
+        "level": cmd_level, "lv": cmd_level,
+        "price": cmd_price, "p": cmd_price,
+        "cancel": cmd_cancel, "c": cmd_cancel,
+        "status": cmd_status, "s": cmd_status,
+        "data": cmd_data, "dt": cmd_data,
+        "mark": cmd_mark, "mk": cmd_mark,
+    })
+
+    # Dot-prefix MessageHandler (e.g. ".add xauusd 5")
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(r'^\.\w+'), _handle_dot_command
+    ))
 
     # Start scheduler in background
     async def post_init(app: Application):

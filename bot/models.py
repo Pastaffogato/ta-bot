@@ -42,3 +42,14 @@ class CandleDelivery:
     alert_key: str = ""  # e.g. "XAUUSD:5" or "timer:5"
     candle_open_utc: str = ""
     sent_at: str = ""
+
+
+@dataclass
+class Mark:
+    id: int = 0
+    chat_id: int = 0
+    symbol: str = ""
+    price: float = 0.0
+    created_at: str = ""
+    expires_at: Optional[str] = None  # ISO timestamp, None = GTC
+    label: str = ""  # optional user note

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bot.config import DB_PATH
-from bot.models import CandleAlert, CandleDelivery, PriceAlert, User
+from bot.models import CandleAlert, CandleDelivery, Mark, PriceAlert, User
 
 _conn_local = threading.local()
 
@@ -70,6 +70,23 @@ def init_db() -> None:
             candle_open_utc TEXT NOT NULL,
             sent_at        TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (chat_id, alert_key, candle_open_utc)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_prefs (
+            chat_id INTEGER NOT NULL REFERENCES users(chat_id),
+            key     TEXT NOT NULL,
+            value   TEXT NOT NULL DEFAULT 'on',
+            PRIMARY KEY (chat_id, key)
+        );
+
+        CREATE TABLE IF NOT EXISTS marks (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id    INTEGER NOT NULL REFERENCES users(chat_id),
+            symbol     TEXT NOT NULL,
+            price      REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT,
+            label      TEXT NOT NULL DEFAULT ''
         );
     """)
     conn.commit()
@@ -261,6 +278,59 @@ def record_delivery(chat_id: int, alert_key: str, candle_open_utc: str) -> bool:
         return False
 
 
+# ---- user preferences ----
+
+def get_user_prefs(chat_id: int) -> dict[str, str]:
+    rows = _conn().execute(
+        "SELECT key, value FROM user_prefs WHERE chat_id = ?", (chat_id,)
+    ).fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def set_user_pref(chat_id: int, key: str, value: str) -> None:
+    with _tx() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_prefs (chat_id, key, value) VALUES (?, ?, ?)",
+            (chat_id, key, value),
+        )
+
+
+# ---- marks ----
+
+def add_mark(chat_id: int, symbol: str, price: float, expires_at: Optional[str] = None) -> Mark:
+    with _tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO marks (chat_id, symbol, price, expires_at) VALUES (?, ?, ?, ?)",
+            (chat_id, symbol, price, expires_at),
+        )
+        row = conn.execute("SELECT * FROM marks WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_mark(row)
+
+
+def get_marks(chat_id: int, symbol: Optional[str] = None) -> list[Mark]:
+    if symbol:
+        rows = _conn().execute(
+            "SELECT * FROM marks WHERE chat_id = ? AND symbol = ?"
+            " AND (expires_at IS NULL OR expires_at > datetime('now'))"
+            " ORDER BY id",
+            (chat_id, symbol),
+        ).fetchall()
+    else:
+        rows = _conn().execute(
+            "SELECT * FROM marks WHERE chat_id = ?"
+            " AND (expires_at IS NULL OR expires_at > datetime('now'))"
+            " ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+    return [_row_to_mark(r) for r in rows]
+
+
+def delete_mark(mark_id: int, chat_id: int) -> bool:
+    with _tx() as conn:
+        cur = conn.execute("DELETE FROM marks WHERE id = ? AND chat_id = ?", (mark_id, chat_id))
+        return cur.rowcount > 0
+
+
 # ---- row converters ----
 
 def _row_to_user(row: sqlite3.Row) -> User:
@@ -296,4 +366,16 @@ def _row_to_price(row: sqlite3.Row) -> PriceAlert:
         enabled=bool(row["enabled"]),
         last_side=row["last_side"],
         created_at=row["created_at"],
+    )
+
+
+def _row_to_mark(row: sqlite3.Row) -> Mark:
+    return Mark(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        symbol=row["symbol"],
+        price=row["price"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        label=row["label"],
     )
