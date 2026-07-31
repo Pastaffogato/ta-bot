@@ -99,6 +99,7 @@ def init_db() -> None:
             user_seq      INTEGER NOT NULL DEFAULT 0,
             symbol        TEXT NOT NULL,
             direction     TEXT NOT NULL,
+            order_type    TEXT NOT NULL DEFAULT 'market',
             entry_price   REAL NOT NULL,
             position_size REAL NOT NULL DEFAULT 1.0,
             stop_loss     REAL,
@@ -425,6 +426,7 @@ def add_paper_trade(
     chat_id: int,
     symbol: str,
     direction: str,
+    order_type: str,
     entry_price: float,
     stop_loss: Optional[float] = None,
     take_profit: Optional[float] = None,
@@ -439,9 +441,9 @@ def add_paper_trade(
         while next_seq in used:
             next_seq += 1
         cur = conn.execute(
-            "INSERT INTO paper_trades (chat_id, user_seq, symbol, direction, entry_price, stop_loss, take_profit)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, next_seq, symbol, direction, entry_price, stop_loss, take_profit),
+            "INSERT INTO paper_trades (chat_id, user_seq, symbol, direction, order_type, entry_price, stop_loss, take_profit)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, next_seq, symbol, direction, order_type, entry_price, stop_loss, take_profit),
         )
         row = conn.execute("SELECT * FROM paper_trades WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _row_to_trade(row)
@@ -550,6 +552,7 @@ def _row_to_trade(row: sqlite3.Row) -> PaperTrade:
         user_seq=row["user_seq"],
         symbol=row["symbol"],
         direction=row["direction"],
+        order_type=row["order_type"] if "order_type" in keys else "market",
         entry_price=row["entry_price"],
         position_size=row["position_size"],
         stop_loss=row["stop_loss"] if row["stop_loss"] is not None else None,

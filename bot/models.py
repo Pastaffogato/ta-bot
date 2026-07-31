@@ -65,7 +65,8 @@ class PaperTrade:
     chat_id: int = 0
     user_seq: int = 0  # per-user sequence number (1, 2, 3…)
     symbol: str = ""
-    direction: str = ""  # "long" or "short"
+    direction: str = ""  # "buy" or "sell"
+    order_type: str = "market"  # "market", "limit", "stop"
     entry_price: float = 0.0
     position_size: float = 1.0
     stop_loss: Optional[float] = None

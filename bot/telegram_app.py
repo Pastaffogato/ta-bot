@@ -238,11 +238,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/price XAUUSD above 2400 — directional\n"
         "/cancel p7 — remove price alert\n"
         "/cancel — cancel all price alerts\n\n"
+        "<b>Marks:</b>\n"
+        "/mark XAUUSD 2400 — add mark\n"
+        "/mark del — delete all marks\n"
+        "/mark del 1 — delete mark M1\n"
+        "/mark list — list marks\n"
+        "/mkd — shorthand for mark del\n"
+        "/mkl — shorthand for mark list\n\n"
+        "<b>Paper trade:</b>\n"
+        "/entry — list open trades\n"
+        "/entry XAUUSD buy +50 -30 — market buy, TP+50, SL-30\n"
+        "/entry XAUUSD sell limit 2410 +30 — sell limit\n"
+        "/entry XAUUSD buy stop 2420 +20 — buy stop\n"
+        "/modify t1 sl 2390 — move stop loss\n"
+        "/modify t1 tp 2420 — move take profit\n"
+        "/modify t1 close — close at market\n\n"
         "<b>Other:</b>\n"
+        "/data — toggle OHLC data sections\n"
+        "/clear — clear all alerts + marks\n"
         "/status — bot health\n"
         "/help — this text\n\n"
         "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
-        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s\n"
+        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s, /e, /m, /mk, /dt\n"
         "<b>Focus pair:</b> set /fp, then /a 5 = /a PAIR 5",
         parse_mode=ParseMode.HTML,
     )
@@ -799,30 +816,38 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open a paper trade. /entry [SYMBOL] LONG|SHORT [entry] [sl X] [tp Y]"""
+    """Open or list paper trades. /entry [SYMBOL] BUY|SELL [LIMIT|STOP PRICE] [+TP] [-SL]"""
     chat_id = update.effective_chat.id
     db.ensure_user(chat_id)
     args = context.args or []
 
-    if len(args) < 1:
-        await update.message.reply_text(_err(
-            "Usage:\n"
-            "/entry [SYMBOL] LONG|SHORT [entry] [sl X] [tp Y]\n"
-            "  /entry xauusd long (market)\n"
-            "  /entry xauusd short 2400 sl 2410 tp 2380\n"
-            "  /entry long sl -30 tp +50 (relative pips)"
-        ))
+    # No args or "list" → show open trades
+    if len(args) == 0 or (len(args) == 1 and args[0].lower() in ("list", "ls")):
+        trades = db.get_paper_trades(chat_id)
+        if not trades:
+            await update.message.reply_text("No open paper trades")
+            return
+        lines = []
+        for t in trades:
+            pnl = _calc_unrealized(t, chat_id)
+            ot = f" {t.order_type}" if t.order_type != "market" else ""
+            lines.append(
+                f"t{t.user_seq} {_display_symbol(t.symbol).upper()} {t.direction.upper()}{ot} @ {_fmt_price(t.entry_price, t.symbol)}"
+                f" | SL:{_fmt_price(t.stop_loss, t.symbol)} TP:{_fmt_price(t.take_profit, t.symbol)}"
+                f" | {pnl:+.1f}p"
+            )
+        await update.message.reply_text("\n".join(lines))
         return
 
+    # Parse: [SYMBOL] BUY|SELL [LIMIT|STOP PRICE] [+TP] [-SL]
     focus = _get_focus(chat_id)
     resolved = None
     trade_args = args
 
-    # First arg: symbol or direction
     first = args[0].lower()
-    if first in ("long", "short"):
+    if first in ("buy", "sell"):
         if not focus:
-            await update.message.reply_text(_err("Usage: /entry SYMBOL LONG|SHORT ...\nOr set focus with /fp first"))
+            await update.message.reply_text(_err("Usage: /entry SYMBOL BUY|SELL ...\nOr set focus with /fp first"))
             return
         resolved = focus
         direction = first
@@ -832,13 +857,12 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if resolved is None:
             await update.message.reply_text(_err(f"Symbol not found: {first}"))
             return
-        if len(args) < 2 or args[1].lower() not in ("long", "short"):
-            await update.message.reply_text(_err("Usage: /entry SYMBOL LONG|SHORT ..."))
+        if len(args) < 2 or args[1].lower() not in ("buy", "sell"):
+            await update.message.reply_text(_err("Usage: /entry SYMBOL BUY|SELL [LIMIT|STOP PRICE] [+TP] [-SL]"))
             return
         direction = args[1].lower()
         trade_args = args[2:]
 
-    # Get current price
     tick = await mt5_data.tick(resolved)
     if tick is None:
         await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
@@ -847,31 +871,62 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sinfo = await mt5_data.symbol_info(resolved)
     pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
 
-    # Parse remaining args: [entry_price] [sl X] [tp Y]
-    entry_price = tick.bid if direction == "long" else tick.ask
+    # Defaults: market order
+    order_type = "market"
+    entry_price = tick.ask if direction == "buy" else tick.bid
     stop_loss = None
     take_profit = None
 
     i = 0
     while i < len(trade_args):
         a = trade_args[i].lower()
-        if a == "sl" and i + 1 < len(trade_args):
-            sl_val = trade_args[i + 1]
-            stop_loss = _resolve_relative_price(sl_val, entry_price, pip_size)
+        if a in ("limit", "stop"):
+            if i + 1 >= len(trade_args):
+                break
+            order_type = a
+            try:
+                entry_price = float(trade_args[i + 1])
+            except ValueError:
+                await update.message.reply_text(_err(f"Invalid {a} price: {trade_args[i + 1]}"))
+                return
+            # Validate
+            current = tick.ask if direction == "buy" else tick.bid
+            if a == "limit":
+                if direction == "buy" and entry_price >= current:
+                    await update.message.reply_text(_err(f"Buy limit {entry_price} must be < current {_fmt_price(current, resolved)}"))
+                    return
+                if direction == "sell" and entry_price <= current:
+                    await update.message.reply_text(_err(f"Sell limit {entry_price} must be > current {_fmt_price(current, resolved)}"))
+                    return
+            else:  # stop
+                if direction == "buy" and entry_price <= current:
+                    await update.message.reply_text(_err(f"Buy stop {entry_price} must be > current {_fmt_price(current, resolved)}"))
+                    return
+                if direction == "sell" and entry_price >= current:
+                    await update.message.reply_text(_err(f"Sell stop {entry_price} must be < current {_fmt_price(current, resolved)}"))
+                    return
             i += 2
-        elif a == "tp" and i + 1 < len(trade_args):
-            tp_val = trade_args[i + 1]
-            take_profit = _resolve_relative_price(tp_val, entry_price, pip_size)
-            i += 2
-        else:
-            # Try as entry price
-            entry_price = _resolve_relative_price(a, entry_price, pip_size)
+        elif _REL_RE.match(a):
+            pips = float(a[1:])
+            price = entry_price + pips * pip_size if a[0] == "+" else entry_price - pips * pip_size
+            if direction == "buy":
+                if a[0] == "+":
+                    take_profit = price
+                else:
+                    stop_loss = price
+            else:  # sell
+                if a[0] == "+":
+                    take_profit = entry_price - pips * pip_size
+                else:
+                    stop_loss = entry_price + pips * pip_size
             i += 1
+        else:
+            i += 1  # skip unknown
 
-    trade = db.add_paper_trade(chat_id, resolved, direction, entry_price, stop_loss, take_profit)
+    trade = db.add_paper_trade(chat_id, resolved, direction, order_type, entry_price, stop_loss, take_profit)
     display = _display_symbol(resolved)
     lines = [
-        f"📊 t{trade.user_seq} {display.upper()} {direction.upper()} @ {_fmt_price(entry_price, resolved)}",
+        f"📊 t{trade.user_seq} {display.upper()} {direction.upper()} {order_type.upper()} @ {_fmt_price(entry_price, resolved)}",
     ]
     if stop_loss:
         lines.append(f"  SL: {_fmt_price(stop_loss, resolved)}")
@@ -938,8 +993,8 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text(f"✅ t{user_seq} TP → {_fmt_price(new_tp, trade.symbol)}")
             i += 2
         elif a == "close":
-            exit_price = tick.bid if trade.direction == "long" else tick.ask
-            if trade.direction == "long":
+            exit_price = tick.bid if trade.direction == "buy" else tick.ask
+            if trade.direction == "buy":
                 pnl = (exit_price - trade.entry_price) / pip_size
             else:
                 pnl = (trade.entry_price - exit_price) / pip_size
@@ -965,6 +1020,19 @@ def _resolve_relative_price(val: str, base_price: float, pip_size: float) -> flo
         return float(val)
     except ValueError:
         return base_price  # fallback
+
+
+async def _calc_unrealized(trade: "PaperTrade", chat_id: int) -> float:
+    """Calculate unrealized P&L in pips for a paper trade."""
+    tick = await mt5_data.tick(trade.symbol)
+    if tick is None:
+        return 0.0
+    sinfo = await mt5_data.symbol_info(trade.symbol)
+    pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+    if trade.direction == "buy":
+        return (tick.bid - trade.entry_price) / pip_size
+    else:
+        return (trade.entry_price - tick.ask) / pip_size
 
 
 async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
