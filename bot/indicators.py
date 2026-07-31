@@ -77,8 +77,13 @@ def compute_all(bars: list, skip_current: bool = False) -> IndicatorSnapshot:
         snap.bb_middle = sma20
         snap.bb_upper = sma20 + 2.0 * std20
         snap.bb_lower = sma20 - 2.0 * std20
-        if sma20 > 0:
-            snap.bb_width_pct = float((snap.bb_upper - snap.bb_lower) / sma20 * 100)
+        
+        # Bollinger %B: position of the latest close within the band range.
+        bb_range = snap.bb_upper - snap.bb_lower
+        if bb_range > 0:
+            snap.bb_width_pct = float(
+                (snap.current_close - snap.bb_lower) / bb_range * 100.0
+            )
 
     # ── ATR(14) with rolling last 3 ──
     if n >= 15:
