@@ -179,38 +179,41 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except ValueError as e:
             await update.message.reply_text(_err(str(e)))
+        return
 
-    else:
-        # /add SYMBOL TIMEFRAME
-        symbol = args[0].upper()
-        tf = parse_tf(args[1])
+    # /add SYMBOL TIMEFRAME [TIMEFRAME ...]
+    symbol = args[0].upper()
+    resolved = await mt5_data.resolve_symbol(symbol)
+    if resolved is None:
+        suggestions = await mt5_data.suggest_symbols(symbol)
+        if suggestions:
+            s = ", ".join(suggestions[:10])
+            await update.message.reply_text(
+                f"❌ Symbol '{symbol}' not found.\nDid you mean: {s}?"
+            )
+        else:
+            await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
+        return
+
+    tfs = []
+    for a in args[1:]:
+        tf = parse_tf(a)
         if tf is None:
-            await update.message.reply_text(_err(f"Unknown timeframe: {args[1]}"))
+            await update.message.reply_text(_err(f"Unknown timeframe: {a}"))
             return
+        tfs.append(tf)
 
-        resolved = await mt5_data.resolve_symbol(symbol)
-        if resolved is None:
-            suggestions = await mt5_data.suggest_symbols(symbol)
-            if suggestions:
-                s = ", ".join(suggestions[:10])
-                await update.message.reply_text(
-                    f"❌ Symbol '{symbol}' not found.\nDid you mean: {s}?"
-                )
-            else:
-                await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
-            return
-
+    display = _display_symbol(resolved)
+    lines = []
+    for tf in tfs:
         try:
             db.add_candle_alert(chat_id, symbol=resolved, timeframe_min=tf)
-            scheduler.subscriptions_changed.set()
-            display = _display_symbol(resolved)
-            await update.message.reply_text(
-                f"✅ {display.upper()} {tf_label(tf)} alert\n"
-                f"Pre-close offset: {db.get_user(chat_id).default_offset_s}s\n"
-                f"/del {display} {tf} to remove"
-            )
+            lines.append(f"✅ {display.upper()} {tf_label(tf)}")
         except ValueError as e:
-            await update.message.reply_text(_err(str(e)))
+            lines.append(_err(str(e)))
+    scheduler.subscriptions_changed.set()
+    lines.append(f"Pre-close offset: {db.get_user(chat_id).default_offset_s}s")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -265,25 +268,31 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(_err(f"Unknown timeframe: {args[0]} — use /del SYMBOL TIMEFRAME"))
         return
 
-    # /del SYMBOL TIMEFRAME
+    # /del SYMBOL TIMEFRAME [TIMEFRAME ...]
     symbol = args[0].upper()
-    tf = parse_tf(args[1])
-    if tf is None:
-        await update.message.reply_text(_err(f"Unknown timeframe: {args[1]}"))
-        return
-
     resolved = await mt5_data.resolve_symbol(symbol)
     if resolved is None:
         await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
         return
 
-    n = db.delete_candle_alerts_by(chat_id, symbol=resolved, timeframe_min=tf)
-    if n > 0:
+    tfs = []
+    for a in args[1:]:
+        tf = parse_tf(a)
+        if tf is None:
+            await update.message.reply_text(_err(f"Unknown timeframe: {a}"))
+            return
+        tfs.append(tf)
+
+    display = _display_symbol(resolved)
+    total = 0
+    for tf in tfs:
+        n = db.delete_candle_alerts_by(chat_id, symbol=resolved, timeframe_min=tf)
+        total += n
+    if total > 0:
         scheduler.subscriptions_changed.set()
-        display = _display_symbol(resolved)
-        await update.message.reply_text(f"🗑️ Removed {n} {display.upper()} {tf_label(tf)} alert(s)")
+        await update.message.reply_text(f"🗑️ Removed {total} {display.upper()} alert(s)")
     else:
-        await update.message.reply_text(f"No {_display_symbol(resolved).upper()} {tf_label(tf)} alerts")
+        await update.message.reply_text(f"No {display.upper()} alerts to remove")
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,6 +493,31 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"Current bid: {_fmt_ohlc(tick.bid, focus, None)}")
             await update.message.reply_text("\n".join(["✅ Price alerts:"] + lines))
             return
+
+    # Non-fp multi-arg: /price XAUUSD 2400 2450 2500
+    if not focus and len(args) >= 2:
+        try:
+            targets = [float(a) for a in args[1:]]
+        except ValueError:
+            targets = None
+        if targets:
+            resolved = await mt5_data.resolve_symbol(args[0])
+            if resolved is not None:
+                tick = await mt5_data.tick(resolved)
+                if tick is None:
+                    await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
+                    return
+                display = _display_symbol(resolved)
+                lines = []
+                for target in targets:
+                    price = tick.bid
+                    current_side = "above" if price > target else "below"
+                    alert = db.add_price_alert(chat_id, resolved, target, None)
+                    db.update_price_alert(alert.id, last_side=current_side)
+                    lines.append(f"p{alert.user_seq} {display.upper()} crossing {target}")
+                lines.append(f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}")
+                await update.message.reply_text("\n".join(["✅ Price alerts:"] + lines))
+                return
 
     direction = None
     target = None
@@ -779,23 +813,60 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines))
         return
 
-    # Add mark: /mark [SYMBOL] <price> [expire_min]
+    # Add mark: /mark [SYMBOL] <price> [price ...] [expire_min]
     try:
-        price = float(args[0])
+        float(args[0])
+        # First arg is a price → fp mode
         focus = _get_focus(chat_id)
         if not focus:
             await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]\nOr set focus with /fp first, then /mark 2400.50"))
             return
+
+        # Multi-mark with fp: /mark 2400 2450 2500 (3+ prices, no expiration)
+        if len(args) >= 3:
+            try:
+                prices = [float(a) for a in args]
+            except ValueError:
+                prices = None
+            if prices:
+                display = _display_symbol(focus)
+                marks = []
+                for p in prices:
+                    m = db.add_mark(chat_id, focus, p, None)
+                    marks.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(p, focus)}")
+                await update.message.reply_text("📍 " + "\n".join(marks))
+                return
+
+        # Single mark with fp
         resolved = focus
         symbol = focus
+        price = float(args[0])
         price_idx = 0
     except ValueError:
+        # First arg is a symbol
         symbol = args[0]
         resolved = await mt5_data.resolve_symbol(symbol)
         if resolved is None:
             await update.message.reply_text(_err(f"Symbol not found: {symbol}"))
             return
         symbol = resolved
+
+        # Multi-mark non-fp: /mark XAUUSD 2400 2450 2500 (symbol + 2+ prices)
+        if len(args) >= 3:
+            try:
+                prices = [float(a) for a in args[1:]]
+            except ValueError:
+                prices = None
+            if prices:
+                display = _display_symbol(symbol)
+                marks = []
+                for p in prices:
+                    m = db.add_mark(chat_id, symbol, p, None)
+                    marks.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(p, symbol)}")
+                await update.message.reply_text("📍 " + "\n".join(marks))
+                return
+
+        # Single mark
         try:
             price = float(args[1])
         except (IndexError, ValueError):
