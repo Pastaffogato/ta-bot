@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bot import config, db, mt5_data
-from bot.models import CandleAlert, PriceAlert
+from bot.models import CandleAlert, PaperTrade, PriceAlert
 from bot.timeframes import tf_label
 
 logger = logging.getLogger(__name__)
@@ -28,13 +28,17 @@ async def scheduler_loop(
     send_candle: callable,
     send_price: callable,
     send_error: callable,
+    send_paper_trade: callable = None,
 ) -> None:
-    """Run candle and price schedulers as independent tasks."""
+    """Run candle, price, and paper-trade schedulers as independent tasks."""
     logger.info("Scheduler started")
-    await asyncio.gather(
+    tasks = [
         _candle_loop(send_candle, send_error),
         _price_loop(send_price),
-    )
+    ]
+    if send_paper_trade:
+        tasks.append(_paper_trade_loop(send_paper_trade))
+    await asyncio.gather(*tasks)
 
 
 async def _candle_loop(
@@ -330,3 +334,112 @@ async def _process_price_alerts(
 def _next_boundary(now: float, interval_s: int) -> float:
     """Next boundary time for a fixed-interval schedule (UTC epoch)."""
     return ((now // interval_s) + 1) * interval_s
+
+
+async def _paper_trade_loop(
+    send_paper_trade: callable,
+) -> None:
+    """Monitor paper trades: activate limit/stop orders, check SL/TP."""
+    while True:
+        try:
+            trades = db.get_all_open_paper_trades()
+            if trades:
+                await _process_paper_trades(trades, send_paper_trade)
+            await asyncio.sleep(config.PRICE_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Paper trade scheduler error")
+            await asyncio.sleep(5)
+
+
+async def _process_paper_trades(
+    trades: list[PaperTrade],
+    send_paper_trade: callable,
+) -> None:
+    """Check limit/stop activation and SL/TP for paper trades."""
+    symbols = {t.symbol for t in trades}
+    for symbol in symbols:
+        tick = await mt5_data.tick(symbol)
+        if tick is None:
+            continue
+        sinfo = await mt5_data.symbol_info(symbol)
+        pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+
+        for trade in trades:
+            if trade.symbol != symbol:
+                continue
+
+            # ── limit/stop order activation ──
+            if trade.order_type in ("limit", "stop"):
+                activated = False
+                if trade.order_type == "limit":
+                    if trade.direction == "buy" and tick.bid <= trade.entry_price:
+                        activated = True
+                    elif trade.direction == "sell" and tick.ask >= trade.entry_price:
+                        activated = True
+                elif trade.order_type == "stop":
+                    if trade.direction == "buy" and tick.ask >= trade.entry_price:
+                        activated = True
+                    elif trade.direction == "sell" and tick.bid <= trade.entry_price:
+                        activated = True
+
+                if activated:
+                    db.update_paper_trade(trade.id, order_type="market")
+                    trade.order_type = "market"
+                    try:
+                        await send_paper_trade(
+                            chat_id=trade.chat_id,
+                            trade=trade,
+                            event="activated",
+                            price=trade.entry_price,
+                        )
+                    except Exception:
+                        logger.exception("Failed to send activation alert to chat %d", trade.chat_id)
+                    # fall through to SL/TP check now that it's market
+                else:
+                    continue  # skip SL/TP for unfilled pending orders
+
+            # ── SL/TP for market orders ──
+            if trade.stop_loss is not None:
+                sl_hit = False
+                if trade.direction == "buy" and tick.bid <= trade.stop_loss:
+                    sl_hit = True
+                elif trade.direction == "sell" and tick.ask >= trade.stop_loss:
+                    sl_hit = True
+
+                if sl_hit:
+                    pnl_pips = (trade.stop_loss - trade.entry_price) / pip_size if trade.direction == "buy" else (trade.entry_price - trade.stop_loss) / pip_size
+                    db.close_paper_trade(trade.id, trade.stop_loss, round(pnl_pips, 1))
+                    try:
+                        await send_paper_trade(
+                            chat_id=trade.chat_id,
+                            trade=trade,
+                            event="sl_hit",
+                            price=trade.stop_loss,
+                            pnl=round(pnl_pips, 1),
+                        )
+                    except Exception:
+                        logger.exception("Failed to send SL alert to chat %d", trade.chat_id)
+                    continue
+
+            if trade.take_profit is not None:
+                tp_hit = False
+                if trade.direction == "buy" and tick.bid >= trade.take_profit:
+                    tp_hit = True
+                elif trade.direction == "sell" and tick.ask <= trade.take_profit:
+                    tp_hit = True
+
+                if tp_hit:
+                    pnl_pips = (trade.take_profit - trade.entry_price) / pip_size if trade.direction == "buy" else (trade.entry_price - trade.take_profit) / pip_size
+                    db.close_paper_trade(trade.id, trade.take_profit, round(pnl_pips, 1))
+                    try:
+                        await send_paper_trade(
+                            chat_id=trade.chat_id,
+                            trade=trade,
+                            event="tp_hit",
+                            price=trade.take_profit,
+                            pnl=round(pnl_pips, 1),
+                        )
+                    except Exception:
+                        logger.exception("Failed to send TP alert to chat %d", trade.chat_id)

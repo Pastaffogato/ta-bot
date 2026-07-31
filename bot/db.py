@@ -477,6 +477,14 @@ def get_paper_trade_by_user_seq(chat_id: int, user_seq: int) -> Optional[PaperTr
     return _row_to_trade(row) if row else None
 
 
+def get_all_open_paper_trades() -> list[PaperTrade]:
+    """Return all open paper trades across all users (for scheduler monitoring)."""
+    rows = _conn().execute(
+        "SELECT * FROM paper_trades WHERE status = 'open' ORDER BY chat_id, user_seq",
+    ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
 def update_paper_trade(trade_id: int, **kwargs) -> None:
     if not kwargs:
         return

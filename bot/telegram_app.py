@@ -1376,6 +1376,37 @@ async def _send_error(chat_id: int, msg: str) -> None:
             pass
 
 
+async def _send_paper_trade(
+    chat_id: int,
+    trade,
+    event: str,
+    price: float,
+    pnl: float = 0.0,
+) -> None:
+    """Called by the scheduler for paper trade events (activated, sl_hit, tp_hit)."""
+    display = _display_symbol(trade.symbol)
+    dir_str = trade.direction.upper()
+    price_str = _fmt_price(price, trade.symbol)
+
+    if event == "activated":
+        text = (
+            f"✅ t{trade.user_seq} {display.upper()} {dir_str} ACTIVATED @ {price_str}\n"
+            f"SL: {_fmt_price(trade.stop_loss, trade.symbol)} | TP: {_fmt_price(trade.take_profit, trade.symbol)}"
+        )
+    elif event == "sl_hit":
+        text = f"🛑 t{trade.user_seq} {display.upper()} {dir_str} SL hit @ {price_str} | {pnl:+.1f}p"
+    elif event == "tp_hit":
+        text = f"🎯 t{trade.user_seq} {display.upper()} {dir_str} TP hit @ {price_str} | {pnl:+.1f}p"
+    else:
+        return
+
+    if _app_ref:
+        try:
+            await _app_ref.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
 # ---- app reference for scheduler callbacks ----
 _app_ref: "Application | None" = None
 
@@ -1472,7 +1503,7 @@ def build_app() -> Application:
     # Start scheduler in background
     async def post_init(app: Application):
         asyncio.create_task(
-            scheduler.scheduler_loop(_send_candle, _send_price, _send_error),
+            scheduler.scheduler_loop(_send_candle, _send_price, _send_error, _send_paper_trade),
             name="scheduler",
         )
 
