@@ -49,6 +49,44 @@ def _err(msg: str) -> str:
     return f"❌ {msg}"
 
 
+import re
+
+_EXPIRY_RE = re.compile(r'^(\d+)([smh])$', re.IGNORECASE)
+
+
+def _parse_expiry(arg: str) -> tuple[int, str] | None:
+    """Parse expiry suffix. Returns (seconds, display_label) or None."""
+    m = _EXPIRY_RE.match(arg)
+    if not m:
+        return None
+    val = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit == 's':
+        return val, f"{val}s"
+    elif unit == 'm':
+        return val * 60, f"{val}m"
+    else:  # 'h'
+        return val * 3600, f"{val}h"
+
+
+def _parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | None]:
+    """Separate prices and optional expiry suffix from mark args.
+    Returns (prices, expiry_seconds, expiry_label)."""
+    prices = []
+    expiry_s = None
+    expiry_label = None
+    for a in args:
+        exp = _parse_expiry(a)
+        if exp is not None:
+            expiry_s, expiry_label = exp
+        else:
+            try:
+                prices.append(float(a))
+            except ValueError:
+                pass  # skip non-price, non-expiry args
+    return prices, expiry_s, expiry_label
+
+
 # ============================================================
 # Command handlers
 # ============================================================
@@ -765,7 +803,7 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         await update.message.reply_text(_err(
             "Usage:\n"
-            "/mark <symbol> <price> [expire_min]\n"
+            "/mark <symbol> <price> [price ...] [30m|2h|45s]\n"
             "/mark del [id] — delete all or specific\n"
             "/mark list [symbol]"
         ))
@@ -813,35 +851,34 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines))
         return
 
-    # Add mark: /mark [SYMBOL] <price> [price ...] [expire_min]
+    # Add mark: /mark [SYMBOL] <price> [price ...] [expiry_suffix]
+    # expiry_suffix: e.g. 30m, 2h, 45s
     try:
         float(args[0])
         # First arg is a price → fp mode
         focus = _get_focus(chat_id)
         if not focus:
-            await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]\nOr set focus with /fp first, then /mark 2400.50"))
+            await update.message.reply_text(_err("Usage: /mark <symbol> <price> [price ...] [30m|2h|45s]\nOr set focus with /fp first, then /mark 2400.50"))
             return
 
-        # Multi-mark with fp: /mark 2400 2450 2500 (3+ prices, no expiration)
-        if len(args) >= 3:
-            try:
-                prices = [float(a) for a in args]
-            except ValueError:
-                prices = None
-            if prices:
-                display = _display_symbol(focus)
-                marks = []
-                for p in prices:
-                    m = db.add_mark(chat_id, focus, p, None)
-                    marks.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(p, focus)}")
-                await update.message.reply_text("📍 " + "\n".join(marks))
-                return
+        # Separate prices from expiry
+        prices, expiry_s, expiry_label = _parse_mark_args(args)
+        if not prices:
+            await update.message.reply_text(_err("No valid price specified"))
+            return
 
-        # Single mark with fp
-        resolved = focus
-        symbol = focus
-        price = float(args[0])
-        price_idx = 0
+        from datetime import timedelta
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
+
+        display = _display_symbol(focus)
+        marks = []
+        for p in prices:
+            m = db.add_mark(chat_id, focus, p, expires_at)
+            marks.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(p, focus)}")
+        exp_str = f" (expires in {expiry_label})" if expiry_label else ""
+        await update.message.reply_text("📍 " + "\n".join(marks) + exp_str)
+        return
+
     except ValueError:
         # First arg is a symbol
         symbol = args[0]
@@ -851,46 +888,23 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         symbol = resolved
 
-        # Multi-mark non-fp: /mark XAUUSD 2400 2450 2500 (symbol + 2+ prices)
-        if len(args) >= 3:
-            try:
-                prices = [float(a) for a in args[1:]]
-            except ValueError:
-                prices = None
-            if prices:
-                display = _display_symbol(symbol)
-                marks = []
-                for p in prices:
-                    m = db.add_mark(chat_id, symbol, p, None)
-                    marks.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(p, symbol)}")
-                await update.message.reply_text("📍 " + "\n".join(marks))
-                return
-
-        # Single mark
-        try:
-            price = float(args[1])
-        except (IndexError, ValueError):
-            await update.message.reply_text(_err("Usage: /mark <symbol> <price> [expire_min]"))
-            return
-        price_idx = 1
-
-    expires_at = None
-    if len(args) > price_idx + 1:
-        try:
-            expire_min = int(args[price_idx + 1])
-            if expire_min > 0:
-                from datetime import timedelta
-                expires_at = (datetime.now(timezone.utc) + timedelta(minutes=expire_min)).isoformat()
-        except ValueError:
-            await update.message.reply_text(_err(f"Invalid expiration: {args[price_idx + 1]}"))
+        # Separate prices from expiry in args[1:]
+        prices, expiry_s, expiry_label = _parse_mark_args(args[1:])
+        if not prices:
+            await update.message.reply_text(_err("No valid price specified"))
             return
 
-    mark = db.add_mark(chat_id, symbol, price, expires_at)
-    display = _display_symbol(symbol)
-    exp_str = f" (expires in {args[price_idx + 1]}min)" if len(args) > price_idx + 1 else ""
-    await update.message.reply_text(
-        f"📍 M{mark.user_seq}: {display.upper()} {_fmt_price(price, symbol)}{exp_str}"
-    )
+        from datetime import timedelta
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
+
+        display = _display_symbol(symbol)
+        marks = []
+        for p in prices:
+            m = db.add_mark(chat_id, symbol, p, expires_at)
+            marks.append(f"M{m.user_seq}: {display.upper()} {_fmt_price(p, symbol)}")
+        exp_str = f" (expires in {expiry_label})" if expiry_label else ""
+        await update.message.reply_text("📍 " + "\n".join(marks) + exp_str)
+        return
 
 
 # ============================================================
