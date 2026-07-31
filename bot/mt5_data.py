@@ -218,6 +218,20 @@ async def today_open_bar(symbol: str) -> Optional[Bar]:
     return _bar_from_row(bars[0], symbol, 1440)
 
 
+async def bars_n(symbol: str, timeframe_min: int, count: int) -> list[Bar]:
+    """Fetch the last N bars (0=current, 1=prev, ..., N-1=oldest).
+
+    Returns bars newest-first. An empty list means no data available.
+    """
+    tf = _mt5_timeframe(timeframe_min)
+    if tf is None:
+        return []
+    bars = await _call_mt5(mt5.copy_rates_from_pos, symbol, tf, 0, count)
+    if bars is None or len(bars) == 0:
+        return []
+    return [_bar_from_row(b, symbol, timeframe_min) for b in bars]
+
+
 # ---- internal helpers ----
 
 def _bar_from_row(b, symbol: str, timeframe_min: int) -> Bar:

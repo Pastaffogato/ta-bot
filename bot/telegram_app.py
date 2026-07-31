@@ -916,7 +916,7 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.ensure_user(chat_id)
     args = context.args
 
-    VALID_PREFS = {"show_pattern", "show_ohlc", "show_range_body", "show_bid_ask", "show_marks"}
+    VALID_PREFS = {"show_pattern", "show_ohlc", "show_range_body", "show_bid_ask", "show_marks", "show_indicators"}
 
     if not args:
         prefs = db.get_user_prefs(chat_id)
@@ -1063,6 +1063,70 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         exp_str = f" (expires in {expiry_label})" if expiry_label else ""
         await update.message.reply_text("📍 " + "\n".join(marks) + exp_str)
         return
+
+
+async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show indicator data for a symbol/timeframe. /ind <symbol> [tf]"""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        focus = _get_focus(chat_id)
+        if not focus:
+            await update.message.reply_text(_err("Usage: /ind <symbol> [tf]\nOr set focus with /fp first"))
+            return
+        symbol = focus
+        tf_raw = "5"  # default M5
+    elif len(args) == 1:
+        # Could be symbol or symbol+tf
+        resolved = await mt5_data.resolve_symbol(args[0])
+        if resolved:
+            symbol = resolved
+            tf_raw = "5"
+        elif focus := _get_focus(chat_id):
+            symbol = focus
+            tf_raw = args[0]
+        else:
+            await update.message.reply_text(_err(f"Symbol not found: {args[0]}"))
+            return
+    else:
+        resolved = await mt5_data.resolve_symbol(args[0])
+        if resolved:
+            symbol = resolved
+        elif focus := _get_focus(chat_id):
+            symbol = focus
+            tf_raw = args[0]
+        else:
+            await update.message.reply_text(_err(f"Symbol not found: {args[0]}"))
+            return
+        tf_raw = args[1] if len(args) > 1 else "5"
+
+    tf_min = parse_tf(tf_raw)
+    if tf_min is None:
+        await update.message.reply_text(_err(f"Invalid timeframe: {tf_raw}"))
+        return
+
+    # Fetch tick + bars
+    tick = await mt5_data.tick(symbol)
+    if tick is None:
+        await update.message.reply_text(_err("No tick data"))
+        return
+
+    sinfo = await mt5_data.symbol_info(symbol)
+
+    bars = await mt5_data.bars_n(symbol, tf_min, 51)
+    if not bars:
+        await update.message.reply_text(_err("No bar data available"))
+        return
+
+    from bot.indicators import compute_all, format_indicator_full
+
+    snap = compute_all(bars)
+    display = _display_symbol(symbol)
+    header = f"{display.upper()} {tf_label(tf_min)}  Bid: {_fmt_ohlc(tick.bid, symbol, sinfo)}"
+    report = format_indicator_full(snap, symbol, sinfo)
+
+    await update.message.reply_text(f"{header}\n\n{report}")
 
 
 # ============================================================

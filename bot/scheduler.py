@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot import config, db, mt5_data
+from bot import config, db, indicators, mt5_data
 from bot.models import CandleAlert, PaperTrade, PriceAlert
 from bot.timeframes import tf_label
 
@@ -195,11 +195,21 @@ async def _send_group(
             tick = await mt5_data.tick(symbol)  # retry once if needed
 
         sinfo = await mt5_data.symbol_info(symbol)
+
+        # ── indicator computation (fetch 51 bars for SMA50) ──
+        ind_snap = None
+        try:
+            bars = await mt5_data.bars_n(symbol, tf_min, 51)
+            if bars:
+                ind_snap = indicators.compute_all(bars)
+        except Exception:
+            logger.debug("Indicator fetch failed for %s %s", symbol, tf_label(tf_min))
     else:
         bar = None
         prev_bar = None
         tick = None
         sinfo = None
+        ind_snap = None
 
     for alert in g["alerts"]:
         alert_key = f"{symbol or 'timer'}:{tf_min}"
@@ -219,6 +229,7 @@ async def _send_group(
                 sinfo=sinfo,
                 close_epoch=close_epoch,
                 sent_epoch=sent_epoch,
+                ind_snap=ind_snap,
             )
         except Exception:
             logger.exception("Failed to send candle alert to chat %d", alert.chat_id)

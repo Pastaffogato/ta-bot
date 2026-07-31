@@ -44,6 +44,7 @@ async def _send_candle(
     sinfo,
     close_epoch: float,
     sent_epoch: float,
+    ind_snap=None,
 ) -> None:
     """Called by the scheduler to deliver a candle alert."""
     if symbol is None:
@@ -53,7 +54,7 @@ async def _send_candle(
         )
     else:
         text = format_candle_message(
-            symbol, timeframe_min, bar, prev_bar, tick, sinfo, close_epoch, sent_epoch, chat_id
+            symbol, timeframe_min, bar, prev_bar, tick, sinfo, close_epoch, sent_epoch, chat_id, ind_snap
         )
     if _app_ref:
         await _app_ref.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
@@ -140,7 +141,7 @@ def build_app() -> Application:
     from bot.telegram_app import (
         cmd_add, cmd_cancel, cmd_clear, cmd_data,
         cmd_del, cmd_entry, cmd_focus_pair, cmd_help,
-        cmd_level, cmd_list, cmd_mark, cmd_mark_del, cmd_mark_list,
+        cmd_indicator, cmd_level, cmd_list, cmd_mark, cmd_mark_del, cmd_mark_list,
         cmd_modify, cmd_now, cmd_offset, cmd_price, cmd_status,
     )
 
@@ -168,6 +169,7 @@ def build_app() -> Application:
         ("clear", cmd_clear),
         ("entry", cmd_entry), ("e", cmd_entry),
         ("modify", cmd_modify), ("m", cmd_modify),
+        ("indicator", cmd_indicator), ("ind", cmd_indicator),
     ]
 
     for name, func in handlers:

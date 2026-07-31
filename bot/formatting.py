@@ -69,6 +69,7 @@ def format_candle_message(
     close_epoch: float,
     sent_epoch: float,
     chat_id: int,
+    ind_snap=None,
 ) -> str:
     """Build the candle alert message."""
     disp = display_symbol(symbol) if symbol else "timer"
@@ -127,6 +128,13 @@ def format_candle_message(
                 dist_pips = (tick.bid - m.price) / pip_size
                 sign = "+" if dist_pips >= 0 else ""
                 lines.append(f"📍 M{m.user_seq} {fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
+
+    # Indicators — show when pref is on and data available
+    if ind_snap is not None and prefs.get("show_indicators", "off") != "off":
+        from bot.indicators import format_indicator_section
+        indicator_text = format_indicator_section(ind_snap, symbol, sinfo)
+        if indicator_text:
+            lines.append(indicator_text)
 
     return "\n".join(lines)
 
