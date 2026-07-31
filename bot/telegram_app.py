@@ -1,6 +1,7 @@
-"""Telegram handlers, message formatting, and bot wiring.
+"""Telegram command handlers.
 
-All commands, callback functions for the scheduler, and message builders.
+All commands live here.  Formatting and argument parsing are in
+bot.formatting and bot.parsing respectively.  App wiring is in bot.app.
 """
 
 import asyncio
@@ -11,12 +12,29 @@ from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ContextTypes
 
 from bot import config, db, mt5_data, patterns, scheduler
 from bot.models import CandleAlert, PriceAlert
 from bot.mt5_data import Bar, Tick, SymbolInfo
 from bot.timeframes import parse_tf, tf_label
+from bot.formatting import (
+    display_symbol as _display_symbol,
+    err as _err,
+    fmt_expiry as _fmt_expiry,
+    fmt_ohlc as _fmt_ohlc,
+    fmt_price as _fmt_price,
+    format_candle_message as _format_candle_message,
+    now_utc as _now_utc,
+)
+from bot.parsing import (
+    _EXPIRY_RE,
+    _REL_RE,
+    parse_expiry as _parse_expiry,
+    parse_mark_args as _parse_mark_args,
+    resolve_price_args as _resolve_price_args,
+    resolve_relative_price as _resolve_relative_price,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,142 +48,6 @@ _focus_pairs: dict[int, str] = {}
 
 def _get_focus(chat_id: int) -> Optional[str]:
     return _focus_pairs.get(chat_id)
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-
-def _display_symbol(broker_symbol: str) -> str:
-    """Convert broker symbol to ideal name for display (e.g. XAUUSD.pc → xauusd)."""
-    return config.PAIRS_REVERSE.get(broker_symbol.upper(), broker_symbol.lower())
-
-
-def _err(msg: str) -> str:
-    return f"❌ {msg}"
-
-
-import re
-
-_EXPIRY_RE = re.compile(r'^(\d+)([smh])$', re.IGNORECASE)
-_REL_RE = re.compile(r'^([+-])(\d+(?:\.\d+)?)$')
-
-
-def _parse_expiry(arg: str) -> tuple[int, str] | None:
-    """Parse expiry suffix. Returns (seconds, display_label) or None."""
-    m = _EXPIRY_RE.match(arg)
-    if not m:
-        return None
-    val = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit == 's':
-        return val, f"{val}s"
-    elif unit == 'm':
-        return val * 60, f"{val}m"
-    else:  # 'h'
-        return val * 3600, f"{val}h"
-
-
-def _fmt_expiry(expires_at: str | None) -> str:
-    """Format expiry as relative time (UTC+8). Returns empty string if no expiry."""
-    if not expires_at:
-        return ""
-    try:
-        exp_dt = datetime.fromisoformat(expires_at)
-    except (ValueError, TypeError):
-        return ""
-    now = datetime.now(timezone.utc)
-    remaining = exp_dt - now
-    total_s = int(remaining.total_seconds())
-    if total_s <= 0:
-        return " (expired)"
-    if total_s < 60:
-        return f" (expires in {total_s}s)"
-    if total_s < 3600:
-        return f" (expires in {total_s // 60}m)"
-    return f" (expires in {total_s // 3600}h{total_s % 3600 // 60}m)"
-
-
-def _parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | None]:
-    """Separate prices and optional expiry suffix from mark args.
-    Returns (prices, expiry_seconds, expiry_label)."""
-    prices = []
-    expiry_s = None
-    expiry_label = None
-    for a in args:
-        exp = _parse_expiry(a)
-        if exp is not None:
-            expiry_s, expiry_label = exp
-        else:
-            try:
-                prices.append(float(a))
-            except ValueError:
-                pass  # skip non-price, non-expiry args
-    return prices, expiry_s, expiry_label
-
-
-def _resolve_price_args(
-    args: list[str],
-    current_price: float,
-    pip_size: float,
-) -> tuple[str, list[float], int | None, str | None]:
-    """Parse price alert args. Returns (alert_type, boundaries, expiry_s, expiry_label).
-    - alert_type: "crossing" or "close"
-    - boundaries: absolute prices (sorted for close, 1-2 items for close, 1+ for crossing)
-    - expiry_s, expiry_label: parsed from suffix
-    """
-    alert_type = "crossing"
-    expiry_s = None
-    expiry_label = None
-    raw_prices: list[float] = []  # parsed absolute prices (before sorting)
-    relative_pips: list[tuple[str, float]] = []  # (sign, pip_amount)
-
-    for a in args:
-        # Check for "close" keyword
-        if a.lower() == "close":
-            alert_type = "close"
-            continue
-
-        # Check for expiry suffix
-        exp = _parse_expiry(a)
-        if exp is not None:
-            expiry_s, expiry_label = exp
-            continue
-
-        # Check for relative price (+N or -N)
-        rel = _REL_RE.match(a)
-        if rel:
-            sign = rel.group(1)
-            pips = float(rel.group(2))
-            relative_pips.append((sign, pips))
-            continue
-
-        # Try absolute price
-        try:
-            raw_prices.append(float(a))
-        except ValueError:
-            pass  # skip unrecognized
-
-    # Resolve relative prices to absolute
-    boundaries = list(raw_prices)
-    for sign, pips in relative_pips:
-        offset = pips * pip_size
-        if sign == "+":
-            boundaries.append(current_price + offset)
-        else:
-            boundaries.append(current_price - offset)
-
-    # For close type: auto-sort, max 2 boundaries
-    if alert_type == "close":
-        boundaries = sorted(boundaries)
-        if len(boundaries) > 2:
-            boundaries = boundaries[:2]
-
-    return alert_type, boundaries, expiry_s, expiry_label
 
 
 # ============================================================
@@ -1013,18 +895,6 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             i += 1  # skip unknown
 
 
-def _resolve_relative_price(val: str, base_price: float, pip_size: float) -> float:
-    """Parse a price value — absolute or relative (+/- pips)."""
-    rel = _REL_RE.match(val)
-    if rel:
-        sign = rel.group(1)
-        pips = float(rel.group(2))
-        offset = pips * pip_size
-        return base_price + offset if sign == "+" else base_price - offset
-    try:
-        return float(val)
-    except ValueError:
-        return base_price  # fallback
 
 
 async def _calc_unrealized(trade: "PaperTrade", chat_id: int) -> float:
@@ -1196,317 +1066,42 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ============================================================
-# Message formatting
+# Shorthand wrappers
 # ============================================================
 
-def _format_candle_message(
-    symbol: str,
-    tf_min: int,
-    bar: Optional[Bar],
-    prev_bar: Optional[Bar],
-    tick: Optional[Tick],
-    sinfo: Optional[SymbolInfo],
-    close_epoch: float,
-    sent_epoch: float,
-    chat_id: int,
-) -> str:
-    """Build the candle alert message."""
-    display = _display_symbol(symbol) if symbol else "timer"
-    prefs = db.get_user_prefs(chat_id)
 
-    pat = patterns.classify(bar, prev_bar) if bar else None
-
-    # Header: EMOJI SYMBOL TF BID +PIPS
-    bid_str = _fmt_ohlc(tick.bid, symbol, sinfo) if tick else "—"
-    emoji = pat.emoji if pat else "⏳"
-    pip_change = ""
-    if bar and tick and sinfo and prev_bar:
-        point_size = sinfo.point
-        if point_size > 0:
-            pip_size = point_size * 10  # 1 pip = 10 points for forex
-            change_pips = (tick.bid - prev_bar.close) / pip_size
-            sign = "+" if change_pips >= 0 else ""
-            pip_change = f" {sign}{change_pips:.1f}p"
-    lines = [f"{emoji} {display.upper()} {tf_label(tf_min)} {bid_str}{pip_change}"]
-
-    if bar:
-        # Pattern
-        if prefs.get("show_pattern", "on") != "off" and pat:
-            lines.append(f"{pat.label}")
-        # OHLC
-        if prefs.get("show_ohlc", "on") != "off":
-            lines.append(
-                f"O {_fmt_ohlc(bar.open, symbol, sinfo)}  "
-                f"H {_fmt_ohlc(bar.high, symbol, sinfo)}  "
-                f"L {_fmt_ohlc(bar.low, symbol, sinfo)}  "
-                f"C {_fmt_ohlc(bar.close, symbol, sinfo)}"
-            )
-        # Range + Body + Wicks
-        if prefs.get("show_range_body", "on") != "off":
-            range_p = bar.high - bar.low
-            body_p = abs(bar.close - bar.open)
-            tw = bar.high - max(bar.open, bar.close)
-            bw = min(bar.open, bar.close) - bar.low
-            lines.append(
-                f"Range {_fmt_ohlc(range_p, symbol, sinfo)}  "
-                f"Body {_fmt_ohlc(body_p, symbol, sinfo)}  "
-                f"TW {_fmt_ohlc(tw, symbol, sinfo)}  "
-                f"BW {_fmt_ohlc(bw, symbol, sinfo)}"
-            )
-
-    if tick and prefs.get("show_bid_ask", "off") != "off":
-        spread = tick.spread
-        lines.append(
-            f"Bid {_fmt_ohlc(tick.bid, symbol, sinfo)}  "
-            f"Ask {_fmt_ohlc(tick.ask, symbol, sinfo)}  "
-            f"Spread {_fmt_spread(spread, sinfo)}"
-        )
-
-    # Marks — show distance from current price
-    if tick and sinfo and symbol and prefs.get("show_marks", "on") != "off":
-        marks = db.get_marks(chat_id, symbol)
-        if marks:
-            pip_size = sinfo.point * 10 if sinfo.point > 0 else 0.01
-            for m in marks:
-                dist_pips = (tick.bid - m.price) / pip_size
-                sign = "+" if dist_pips >= 0 else ""
-                lines.append(f"📍 M{m.user_seq} {_fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
-
-    return "\n".join(lines)
-
-
-def _format_price_alert_message(
-    alert: PriceAlert,
-    price: float,
-    tick: Tick,
-    chat_id: int,
-) -> str:
-    display = _display_symbol(alert.symbol)
-    if alert.alert_type == "close":
-        if alert.target_upper is not None:
-            msg = (
-                f"🔔 <b>{display.upper()}</b> closed within {alert.target:.2f}–{alert.target_upper:.2f}!\n"
-            )
-        else:
-            msg = f"🔔 <b>{display.upper()}</b> closed beyond {alert.target:.2f}!\n"
-    else:
-        dir_str = f"crossed {alert.direction}" if alert.direction else "crossed"
-        msg = f"🔔 <b>{display.upper()}</b> {dir_str} {alert.target}!\n"
-    return msg + (
-        f"Bid: {_fmt_ohlc(tick.bid, alert.symbol, None)}  "
-        f"Ask: {_fmt_ohlc(tick.ask, alert.symbol, None)}"
-    )
-
-
-def _fmt_price(price: float, symbol: str) -> str:
-    """Format price with appropriate decimal places for the symbol."""
-    if price >= 1000:
-        return f"{price:.2f}"
-    elif price >= 100:
-        return f"{price:.3f}"
-    elif price >= 1:
-        return f"{price:.4f}"
-    else:
-        return f"{price:.5f}"
-
-
-def _fmt_spread(spread: float, sinfo: Optional[SymbolInfo]) -> str:
-    if sinfo is None:
-        return f"{spread:.5f}"
-    points = spread / sinfo.point
-    return f"{points:.1f}"
-
-
-def _fmt_ohlc(value: float, symbol: str, sinfo: Optional[SymbolInfo]) -> str:
-    """Format OHLC price using symbol digits if available."""
-    if sinfo is not None:
-        return f"{value:.{sinfo.digits}f}"
-    return _fmt_price(value, symbol)
-
-
-# ============================================================
-# Scheduler callbacks
-# ============================================================
-
-async def _send_candle(
-    chat_id: int,
-    symbol: Optional[str],
-    timeframe_min: int,
-    bar: Optional[Bar],
-    prev_bar: Optional[Bar],
-    tick: Optional[Tick],
-    sinfo: Optional[SymbolInfo],
-    close_epoch: float,
-    sent_epoch: float,
-) -> None:
-    """Called by the scheduler to deliver a candle alert."""
-    if symbol is None:
-        # Timer-only: just a countdown notification
-        text = (
-            f"⏰ {tf_label(timeframe_min)} candle closing\n"
-            f"Time: {_now_utc()} UTC"
-        )
-    else:
-        text = _format_candle_message(
-            symbol, timeframe_min, bar, prev_bar, tick, sinfo, close_epoch, sent_epoch, chat_id
-        )
-
-    # Use bot from context — but we need the app reference
-    if _app_ref:
-        await _app_ref.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-
-
-async def _send_price(
-    chat_id: int,
-    alert: PriceAlert,
-    price: float,
-    tick: Tick,
-) -> None:
-    """Called by the scheduler to deliver a price alert."""
-    text = _format_price_alert_message(alert, price, tick, chat_id)
-    if _app_ref:
-        await _app_ref.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-
-
-async def _send_error(chat_id: int, msg: str) -> None:
-    if _app_ref:
-        try:
-            await _app_ref.bot.send_message(chat_id=chat_id, text=f"⚠️ {msg}")
-        except Exception:
-            pass
-
-
-async def _send_paper_trade(
-    chat_id: int,
-    trade,
-    event: str,
-    price: float,
-    pnl: float = 0.0,
-) -> None:
-    """Called by the scheduler for paper trade events (activated, sl_hit, tp_hit)."""
-    display = _display_symbol(trade.symbol)
-    dir_str = trade.direction.upper()
-    price_str = _fmt_price(price, trade.symbol)
-
-    if event == "activated":
-        text = (
-            f"✅ t{trade.user_seq} {display.upper()} {dir_str} ACTIVATED @ {price_str}\n"
-            f"SL: {_fmt_price(trade.stop_loss, trade.symbol)} | TP: {_fmt_price(trade.take_profit, trade.symbol)}"
-        )
-    elif event == "sl_hit":
-        text = f"🛑 t{trade.user_seq} {display.upper()} {dir_str} SL hit @ {price_str} | {pnl:+.1f}p"
-    elif event == "tp_hit":
-        text = f"🎯 t{trade.user_seq} {display.upper()} {dir_str} TP hit @ {price_str} | {pnl:+.1f}p"
-    else:
-        return
-
-    if _app_ref:
-        try:
-            await _app_ref.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-
-# ---- app reference for scheduler callbacks ----
-_app_ref: "Application | None" = None
-
-# Command dispatch table for dot-prefix MessageHandler
-_COMMANDS: dict[str, callable] = {}
-
-
-async def _handle_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle .command messages — strip dot, parse, dispatch to existing handlers."""
+async def cmd_mark_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shorthand: /mkd [id] — delete marks."""
     text = update.message.text.strip()
-    if not text.startswith("."):
-        return
-    parts = text[1:].split()
-    if not parts:
-        return
-    cmd = parts[0].lower()
-    handler = _COMMANDS.get(cmd)
-    if handler is None:
-        return  # silently ignore unknown dot commands
-    context.args = parts[1:]
-    await handler(update, context)
+    parts = text.split(maxsplit=1)
+    context.args = (["del"] + parts[1:]) if len(parts) > 1 else ["del"]
+    await cmd_mark(update, context)
 
 
-def build_app() -> Application:
-    """Build and configure the PTB Application."""
-    app = Application.builder().token(config.BOT_TOKEN).build()
+async def cmd_mark_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shorthand: /mkl [symbol] — list marks."""
+    context.args = (["list"] + (context.args or []))
+    await cmd_mark(update, context)
 
-    # Store app reference for scheduler callbacks
-    global _app_ref
-    _app_ref = app
 
-    # Register handlers (full names)
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("focus_pair", cmd_focus_pair))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("del", cmd_del))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("offset", cmd_offset))
-    app.add_handler(CommandHandler("now", cmd_now))
-    app.add_handler(CommandHandler("level", cmd_level))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("status", cmd_status))
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove all alerts and marks for this chat."""
+    chat_id = update.effective_chat.id
+    db.ensure_user(chat_id)
 
-    # Shorthand aliases
-    app.add_handler(CommandHandler("fp", cmd_focus_pair))
-    app.add_handler(CommandHandler("a", cmd_add))
-    app.add_handler(CommandHandler("d", cmd_del))
-    app.add_handler(CommandHandler("l", cmd_list))
-    app.add_handler(CommandHandler("o", cmd_offset))
-    app.add_handler(CommandHandler("n", cmd_now))
-    app.add_handler(CommandHandler("lv", cmd_level))
-    app.add_handler(CommandHandler("p", cmd_price))
-    app.add_handler(CommandHandler("c", cmd_cancel))
-    app.add_handler(CommandHandler("s", cmd_status))
-    app.add_handler(CommandHandler("data", cmd_data))
-    app.add_handler(CommandHandler("dt", cmd_data))
-    app.add_handler(CommandHandler("mark", cmd_mark))
-    app.add_handler(CommandHandler("mk", cmd_mark))
-    app.add_handler(CommandHandler("mkd", cmd_mark_del))
-    app.add_handler(CommandHandler("mkl", cmd_mark_list))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("entry", cmd_entry))
-    app.add_handler(CommandHandler("modify", cmd_modify))
-    app.add_handler(CommandHandler("e", cmd_entry))
-    app.add_handler(CommandHandler("m", cmd_modify))
+    n_candle = db.delete_all_candle_alerts(chat_id)
+    n_price = db.delete_all_price_alerts(chat_id)
+    n_mark = db.delete_all_marks(chat_id)
 
-    # Populate dot-prefix dispatch table
-    _COMMANDS.update({
-        "help": cmd_help,
-        "focus_pair": cmd_focus_pair, "fp": cmd_focus_pair,
-        "add": cmd_add, "a": cmd_add,
-        "del": cmd_del, "d": cmd_del,
-        "list": cmd_list, "l": cmd_list,
-        "offset": cmd_offset, "o": cmd_offset,
-        "now": cmd_now, "n": cmd_now,
-        "level": cmd_level, "lv": cmd_level,
-        "price": cmd_price, "p": cmd_price,
-        "cancel": cmd_cancel, "c": cmd_cancel,
-        "status": cmd_status, "s": cmd_status,
-        "data": cmd_data, "dt": cmd_data,
-        "mark": cmd_mark, "mk": cmd_mark,
-        "mkd": cmd_mark_del, "mkl": cmd_mark_list,
-        "clear": cmd_clear,
-        "entry": cmd_entry, "e": cmd_entry,
-        "modify": cmd_modify, "m": cmd_modify,
-    })
+    if n_candle > 0 or n_price > 0:
+        scheduler.subscriptions_changed.set()
 
-    # Dot-prefix MessageHandler (e.g. ".add xauusd 5")
-    app.add_handler(MessageHandler(
-        filters.TEXT & filters.Regex(r'^\.\w+'), _handle_dot_command
-    ))
-
-    # Start scheduler in background
-    async def post_init(app: Application):
-        asyncio.create_task(
-            scheduler.scheduler_loop(_send_candle, _send_price, _send_error, _send_paper_trade),
-            name="scheduler",
-        )
-
-    app.post_init = post_init
-
-    return app
+    total = n_candle + n_price + n_mark
+    if total > 0:
+        parts = []
+        if n_candle: parts.append(f"{n_candle} candle alerts")
+        if n_price: parts.append(f"{n_price} price alerts")
+        if n_mark: parts.append(f"{n_mark} marks")
+        await update.message.reply_text(f"🧹 Cleared {', '.join(parts)}")
+    else:
+        await update.message.reply_text("Nothing to clear")

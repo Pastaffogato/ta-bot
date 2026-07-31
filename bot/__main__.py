@@ -8,7 +8,7 @@ import logging
 import sys
 
 from bot import config, db, mt5_data
-from bot.telegram_app import build_app
+from bot.app import build_app
 
 logger = logging.getLogger(__name__)
 
