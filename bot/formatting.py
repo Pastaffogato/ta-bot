@@ -70,6 +70,7 @@ def format_candle_message(
     sent_epoch: float,
     chat_id: int,
     ind_snap=None,
+    bars=None,
 ) -> str:
     """Build the candle alert message."""
     disp = display_symbol(symbol) if symbol else "timer"
@@ -129,12 +130,44 @@ def format_candle_message(
                 sign = "+" if dist_pips >= 0 else ""
                 lines.append(f"📍 M{m.user_seq} {fmt_ohlc(m.price, symbol, sinfo)}  {sign}{dist_pips:.1f}p")
 
+    # Progression — running paper trades + live price alerts for this symbol
+    if tick and sinfo and symbol and prefs.get("show_progression", "on") != "off":
+        pip_size = sinfo.point * 10 if sinfo.point > 0 else 0.01
+        # Running paper trades (ongoing market orders only, not limit/stop)
+        trades = db.get_paper_trades(chat_id, status="open")
+        for t in trades:
+            if t.symbol == symbol and t.order_type == "market":
+                if t.direction == "buy":
+                    pnl = (tick.bid - t.entry_price) / pip_size
+                else:
+                    pnl = (t.entry_price - tick.ask) / pip_size
+                lines.append(f"📊 t{t.user_seq} {t.direction.upper()} {pnl:+.1f}p")
+        # Live price alerts for this symbol
+        alerts = db.get_price_alerts(chat_id)
+        for a in alerts:
+            if a.symbol == symbol:
+                if a.indicator:
+                    from bot.indicators import indicator_display_label
+                    label = indicator_display_label(a.indicator)
+                    dist = (tick.bid - a.target) / pip_size
+                    lines.append(f"🔔 p{a.user_seq} {label} {dist:+.1f}p")
+                else:
+                    dist = (tick.bid - a.target) / pip_size
+                    lines.append(f"🔔 p{a.user_seq} {a.target:.2f} {dist:+.1f}p")
+
     # Indicators — show when pref is on and data available (default on)
     if ind_snap is not None and prefs.get("show_indicators", "on") != "off":
         from bot.indicators import format_indicator_section
         indicator_text = format_indicator_section(ind_snap, symbol, sinfo, prefs)
         if indicator_text:
             lines.append(indicator_text)
+
+    # Trend — optional one-liner when show_trend pref is on
+    if bars and prefs.get("show_trend", "on") != "off":
+        from bot.indicators import format_trend_section
+        trend_text = format_trend_section(bars, symbol, sinfo)
+        if trend_text:
+            lines.append(trend_text)
 
     return "\n".join(lines)
 
@@ -148,7 +181,12 @@ def format_price_alert_message(
     chat_id: int,
 ) -> str:
     disp = display_symbol(alert.symbol)
-    if alert.alert_type == "close":
+    if alert.indicator:
+        from bot.indicators import indicator_display_label
+        label = indicator_display_label(alert.indicator)
+        dir_str = f"crossed {alert.direction}" if alert.direction else "crossed"
+        msg = f"🔔 <b>{disp.upper()}</b> {dir_str} {label} ({fmt_ohlc(alert.target, alert.symbol, None)})!\n"
+    elif alert.alert_type == "close":
         if alert.target_upper is not None:
             msg = f"🔔 <b>{disp.upper()}</b> closed within {alert.target:.2f}–{alert.target_upper:.2f}!\n"
         else:

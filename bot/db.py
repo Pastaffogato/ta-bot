@@ -141,7 +141,9 @@ def init_db() -> None:
         conn.execute("ALTER TABLE price_alerts ADD COLUMN target_upper REAL")
     if "expires_at" not in cols:
         conn.execute("ALTER TABLE price_alerts ADD COLUMN expires_at TEXT")
-    if "alert_type" not in cols or "target_upper" not in cols or "expires_at" not in cols:
+    if "indicator" not in cols:
+        conn.execute("ALTER TABLE price_alerts ADD COLUMN indicator TEXT")
+    if "alert_type" not in cols or "target_upper" not in cols or "expires_at" not in cols or "indicator" not in cols:
         conn.commit()
 
     # Migration: add order_type to paper_trades
@@ -268,6 +270,7 @@ def add_price_alert(
     alert_type: str = "crossing",
     target_upper: Optional[float] = None,
     expires_at: Optional[str] = None,
+    indicator: Optional[str] = None,
 ) -> PriceAlert:
     with _tx() as conn:
         # Find smallest unused user_seq for this chat_id
@@ -280,9 +283,9 @@ def add_price_alert(
         while next_seq in used:
             next_seq += 1
         cur = conn.execute(
-            "INSERT INTO price_alerts (chat_id, user_seq, symbol, direction, target, alert_type, target_upper, expires_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, next_seq, symbol, direction, target, alert_type, target_upper, expires_at),
+            "INSERT INTO price_alerts (chat_id, user_seq, symbol, direction, target, alert_type, target_upper, expires_at, indicator)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, next_seq, symbol, direction, target, alert_type, target_upper, expires_at, indicator),
         )
         row = conn.execute("SELECT * FROM price_alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _row_to_price(row)
@@ -541,6 +544,7 @@ def _row_to_price(row: sqlite3.Row) -> PriceAlert:
         enabled=bool(row["enabled"]),
         last_side=row["last_side"],
         expires_at=row["expires_at"] if "expires_at" in keys else None,
+        indicator=row["indicator"] if "indicator" in keys else None,
         created_at=row["created_at"],
     )
 

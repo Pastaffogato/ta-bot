@@ -11,7 +11,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 
 **Stack:** Python 3.11+, `python-telegram-bot[job-queue]` v20.x, `MetaTrader5`, `numpy`, `pyyaml`, SQLite via stdlib. Windows-only (MT5 requires Windows).
 
-New `bot/indicators.py` module (Phase 3) adds BB(20,2) on close, SMA50, EMA20, ATR(14) with trend, RSI(14), ADX(14), VWAP, and Relative Volume — all computed from OHLCV bar arrays via numpy.
+`bot/indicators.py` module adds BB(20,2) on close (population std), SMA50, EMA20, ATR(14) with trend (Wilder's), RSI(14) (Wilder's), ADX(14) (Wilder's `alpha=1/period`, matches MT5 ADXW) — all computed from OHLCV bar arrays via numpy. VWAP and Relative Volume were removed during alignment.
 
 ## Architecture
 
@@ -129,6 +129,8 @@ New `bot/indicators.py` module (Phase 3) adds BB(20,2) on close, SMA50, EMA20, A
 5. Sleep until that time (capped at 5s so subscription changes are picked up). Re-check `subscriptions_changed` after wake.
 6. Process all groups whose due time is within `LATE_SEND_TOLERANCE_S` (3s).
 7. `_send_group()`: fetch bar + previous bar + tick + symbol_info → fan out to all subscribed users. Deduplicates delivery via `was_delivered()` / `record_delivery()`.
+8. **Bar-swap detection**: compares `bar.time` (position 0, MT5 server time) against `expected_open_server` (UTC candle open + server offset). If they differ by >2s, the new bar has already appeared → swap `bar = prev_bar`, `prev_bar = bar_at_offset(2)`, and set `new_bar_appeared = True`.
+9. **Indicator alignment**: `ind_snap = compute_all(bars, skip_current=new_bar_appeared)`. When no new bar appeared (common at offset=0), position-0 IS the just-closed candle and must NOT be skipped. When a new bar appeared, position-0 is the new incomplete bar and is skipped. This keeps indicator values aligned with the OHLC candle shown.
 
 #### Price Loop (`_price_loop`)
 1. Poll all enabled price alerts every `PRICE_POLL_INTERVAL_S` (1s).
@@ -154,18 +156,28 @@ New `bot/indicators.py` module (Phase 3) adds BB(20,2) on close, SMA50, EMA20, A
 - `fmt_price(price, symbol)` → adaptive decimal places (≥1000: 2dp, ≥100: 3dp, ≥1: 4dp, else 5dp).
 - `fmt_ohlc(value, symbol, sinfo)` → uses `sinfo.digits` if available.
 - `fmt_spread(spread, sinfo)` → in points.
-- `format_candle_message(...)` → builds the multi-line candle alert. Respects user prefs: `show_pattern`, `show_ohlc`, `show_range_body`, `show_bid_ask`, `show_marks`. Includes marks with distance from current bid.
-- `format_price_alert_message(alert, price, tick, chat_id)` → price alert notification.
+- `format_candle_message(...)` → builds the multi-line candle alert. Respects user prefs: `show_pattern`, `show_ohlc`, `show_range_body`, `show_bid_ask`, `show_marks`, `show_indicators`, `show_progression`, `show_trend` (all default `"on"`). Includes marks with distance from current bid. Progression block shows running paper trades (floating PnL) + live price alerts (distance to target). Indicator block (when on) appended via `format_indicator_section`. Trend one-liner (when on) appended via `format_trend_section`. Accepts `bars=` parameter for trend computation.
+- `format_price_alert_message(alert, price, tick, chat_id)` → price alert notification. Handles indicator-based alerts (shows indicator label + resolved price).
 
 ### `bot/patterns.py` — Candle Pattern Classification
 
-### `bot/indicators.py` — Indicator Computation (Phase 3)
-- `compute_all(bars)` → `IndicatorSnapshot` — all indicators from a list of Bar objects (newest first). Uses numpy for vectorized operations.
-- Indicators: **BB(20,2) on close** (upper/middle/lower, width%), **SMA50**, **EMA20**, **ATR(14)** (with trend: rising/compressing/flat), **RSI(14)** (0-100, Wilder's smoothing), **ADX(14)** (0-100, Wilder's), **VWAP** (cumulative typical price × volume), **RelVol** (current vol / avg vol of last 20).
-- `format_indicator_section(snap, symbol, sinfo)` → compact 2-line display for candle alerts.
+### `bot/indicators.py` — Indicator Computation
+- `compute_all(bars, skip_current=False)` → `IndicatorSnapshot` — all indicators from a list of Bar objects (newest first). Uses numpy for vectorized operations.
+- `skip_current` parameter: when `True`, drops `bars[0]` (the newest/incomplete bar) before computing. The scheduler passes `skip_current=new_bar_appeared` so indicators align with the OHLC candle shown.
+- Indicators: **BB(20,2) on close** (upper/middle/lower, width%, population std `ddof=0`), **SMA50**, **EMA20** (seeded with SMA of first 20 closes), **ATR(14)** (Wilder's smoothing, stores `atr`/`atr_prev`/`atr_prev2`), **RSI(14)** (Wilder's, stores `rsi`/`rsi_prev`/`rsi_prev2`), **ADX(14)** (Wilder's `alpha=1/period`, matches MT5 ADXW; stores `adx`/`di_plus`/`di_minus`). VWAP and Relative Volume were removed.
+- `IndicatorSnapshot` fields: `sma50`, `ema20`, `bb_upper`, `bb_middle`, `bb_lower`, `bb_width_pct`, `atr`, `atr_prev`, `atr_prev2`, `atr_pct`, `rsi`, `rsi_prev`, `rsi_prev2`, `adx`, `di_plus`, `di_minus`, `current_close`, `bar_count`.
+- `format_indicator_section(snap, symbol, sinfo, prefs=None)` → compact 5-line display for candle alerts. Respects granular prefs (`show_bb`, `show_sma`, `show_ema`, `show_atr`, `show_rsi`, `show_adx` — all default `"on"`).
 - `format_indicator_full(snap, symbol, sinfo)` → full report for `/ind` command.
+- 5-line layout: BB → SMA50+EMA20 → ATR → RSI → ADX. Empty lines skipped when granular pref is off.
+- `INDICATOR_TARGETS` dict: maps indicator names to `(attribute, label)` pairs — `sma50`, `ema20`, `bb_upper`, `bb_lower`, `bb_middle`.
+- `resolve_indicator_target(snap, name)` → resolves a dynamic indicator target from a snapshot. Returns float or None. Reusable by price alerts, marks, and paper-trade TP/SL.
+- `indicator_display_label(name)` → human-readable label for an indicator target name.
+- `classify_trend(bars, lookback=20)` → `TrendResult` with `direction` (UP/DOWN/SIDEWAYS), `slope`, `lookback`, `bar_count`, `snap`. Uses linear regression slope with adaptive 0.02% threshold.
+- `format_trend_section(bars, symbol, sinfo, lookback=20)` → compact one-liner for candle alerts: "Trend: 📈 UP  ATR compressing  RSI 54".
+- `format_trend_full(bars, symbol, sinfo, lookback=20)` → multi-line report for `/trend` command: direction + slope + ATR/RSI/ADX context + price vs SMA50 + BB zone.
 - Requires 50+ bars for SMA50, 20+ for BB/EMA, 15+ for ATR/RSI, 28+ for ADX. Missing indicators are None.
 - Bars are reversed internally (newest-first → chronological) before computation.
+- `pip_size = sinfo.point * 10` for forex.
 - `classify(bar, prev_bar)` → `Pattern(emoji, label, bias)`.
 - Detection order: Engulfing (bear/bull) → Hammer → Shooting Star → Doji → Bullish/Bearish.
 - Engulfing requires: body ≥ 5% of range, opposite direction, close crosses previous open.
@@ -179,10 +191,12 @@ New `bot/indicators.py` module (Phase 3) adds BB(20,2) on close, SMA50, EMA20, A
 - Scheduler callbacks: `_send_candle`, `_send_price`, `_send_error`, `_send_paper_trade` — all call `_app_ref.bot.send_message()`.
 
 ### `bot/telegram_app.py` — Command Handlers
-- **11 command handlers**: `cmd_focus_pair`, `cmd_help`, `cmd_add`, `cmd_del`, `cmd_list`, `cmd_offset`, `cmd_now`, `cmd_level`, `cmd_price`, `cmd_cancel`, `cmd_status`, `cmd_data`, `cmd_mark`, `cmd_entry`, `cmd_modify`, `cmd_clear`, plus shorthand wrappers (`cmd_mark_del`, `cmd_mark_list`).
+- **Command handlers**: `cmd_focus_pair`, `cmd_help`, `cmd_add`, `cmd_del`, `cmd_list`, `cmd_offset`, `cmd_now`, `cmd_level`, `cmd_price`, `cmd_cancel`, `cmd_status`, `cmd_data`, `cmd_mark`, `cmd_entry`, `cmd_modify`, `cmd_clear`, `cmd_indicator`, `cmd_trend`, plus shorthand wrappers (`cmd_mark_del`, `cmd_mark_list`).
 - **Focus pair**: `_focus_pairs: dict[int, str]` — per-chat in-memory dict, session-only, not persisted. Resolved via `_get_focus(chat_id)`.
 - **Multi-arg support**: `/add 5 15 30`, `/del 5 15 30`, `/price 2400 2450 2500`, `/mark 2400 2450 2500` — all work with focus pair.
-- **Paper trade**: `/entry` (list or create), `/modify` (sl/tp/close). Entry syntax: buy/sell, optional limit/stop, +N/-N for SL/TP. Modify uses `sl`/`tp` keywords for absolute prices.
+- **Indicator-based price alerts**: `/price sma50 above`, `/price bb_lower` — stores `indicator` field on PriceAlert, scheduler resolves dynamic target each cycle. Also supports expiry: `/price sma50 above 30m`.
+- **Paper trade**: `/entry` (list or create), `/modify` (sl/tp/close). Entry syntax: buy/sell, optional limit/stop, +N/-N for SL/TP, or `tp <indicator>` / `sl <indicator>` for indicator-based TP/SL (e.g. `/entry buy tp sma50 sl bb_lower`). Modify uses `sl`/`tp` keywords for absolute prices, relative pips, or indicator names. `_resolve_tp_sl_value()` async helper resolves indicator names to absolute prices via M1 snapshot.
+- **Trend**: `/trend [SYMBOL] [TF] [LOOKBACK]` — classifies trend as UP/DOWN/SIDEWAYS using linear regression slope, with indicator context (ATR, RSI, ADX, price vs SMA50, BB zone).
 - **Shorthand wrappers**: `cmd_mark_del` delegates to `cmd_mark(["del", ...])`, `cmd_mark_list` delegates to `cmd_mark(["list", ...])`.
 
 ## Database Schema
@@ -190,7 +204,7 @@ New `bot/indicators.py` module (Phase 3) adds BB(20,2) on close, SMA50, EMA20, A
 ```sql
 users (chat_id PK, timezone, default_offset_s, created_at)
 candle_alerts (id PK, chat_id FK→users, symbol, timeframe_min, offset_s, enabled)
-price_alerts (id PK, chat_id FK→users, user_seq, symbol, direction, target, target_upper, alert_type, price_source, repeat, enabled, last_side, expires_at, created_at)
+price_alerts (id PK, chat_id FK→users, user_seq, symbol, direction, target, target_upper, alert_type, price_source, repeat, enabled, last_side, expires_at, indicator, created_at)
 deliveries (chat_id, alert_key, candle_open_utc — composite PK)
 user_prefs (chat_id, key — composite PK, value)
 marks (id PK, chat_id FK→users, user_seq, symbol, price, created_at, expires_at, label)
@@ -230,6 +244,9 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 - **`parse_tf` returns `None`** for unsupported timeframes — always check before using.
 - **`resolve_symbol` may return different case** than what was passed — MT5 returns exact symbol names from the broker.
 - **Paper trade `order_type` transitions** — limit/stop orders become "market" on activation. The scheduler checks this field to decide whether to skip SL/TP for pending orders.
+- **Offset=0 indicator alignment** — At offset=0, MT5 may not have rolled to a new bar yet when the alert fires. The scheduler detects this via `new_bar_appeared` and passes `skip_current=new_bar_appeared` to `compute_all`. If `skip_current` were always `True` (as it was before), indicators would show the candle *before* the just-closed one. `/now` and `/ind` use `skip_current=False` to show the current running candle.
+- **`show_indicators` default is `"on"`** — `format_candle_message` treats unset as `"on"` (line 133 in `formatting.py`). The `/data` command also displays `"on"` as default. Both must agree.
+- **5-line indicator format** — `format_indicator_section` outputs: BB → SMA50+EMA20 → ATR → RSI → ADX. BB bands separated by `-`, width+pct together (`27.9p-0.3%`). ATR and RSI values separated by `-` (no spaces). Granular prefs (`show_bb`, `show_sma`, etc.) drop only their line.
 
 ## Command → Handler Mapping
 
@@ -241,19 +258,20 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 | `/del`, `/d` | `cmd_del` | Multi-arg with focus |
 | `/list`, `/l` | `cmd_list` | Shows candle + price alerts |
 | `/offset`, `/o` | `cmd_offset` | Default offset_s per user |
-| `/now`, `/n` | `cmd_now` | Last completed bar OHLC |
+| `/now`, `/n` | `cmd_now` | Current running candle OHLC + indicators |
 | `/level`, `/lv` | `cmd_level` | Yesterday OHLC + today open |
-| `/price`, `/p` | `cmd_price` | Multi-arg, close type, relative pips, expiry |
+| `/price`, `/p` | `cmd_price` | Multi-arg, close type, relative pips, expiry, indicator targets (sma50, bb_lower, etc.) |
 | `/cancel`, `/c` | `cmd_cancel` | Bare = cancel all, pID = specific |
 | `/status`, `/s` | `cmd_status` | MT5 health + alert counts |
-| `/data`, `/dt` | `cmd_data` | Toggle show_pattern/show_ohlc/etc |
+| `/data`, `/dt` | `cmd_data` | Toggle sections: show_pattern/show_ohlc/show_indicators/show_progression/show_trend + granular indicator prefs |
 | `/mark`, `/mk` | `cmd_mark` | Multi-arg, expiry suffix, del/list subcommands |
 | `/mkd` | `cmd_mark_del` | Delegates to cmd_mark with "del" |
 | `/mkl` | `cmd_mark_list` | Delegates to cmd_mark with "list" |
-| `/entry`, `/e` | `cmd_entry` | List or create paper trades |
-| `/modify`, `/m` | `cmd_modify` | sl/tp/close for paper trades |
+| `/entry`, `/e` | `cmd_entry` | List or create paper trades; supports indicator-based TP/SL |
+| `/modify`, `/m` | `cmd_modify` | sl/tp/close for paper trades; supports indicator names for sl/tp |
 | `/clear` | `cmd_clear` | Remove all alerts + marks |
-| `/indicator`, `/ind` | `cmd_indicator` | On-demand indicator data (Phase 3) |
+| `/indicator`, `/ind` | `cmd_indicator` | On-demand indicator data (current running candle) |
+| `/trend`, `/tr` | `cmd_trend` | Trend classification with lookback + indicator context |
 
 ## Development Workflow
 

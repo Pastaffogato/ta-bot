@@ -115,10 +115,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>OHLC data:</b>\n"
         "/now XAUUSD 3 — live M3 OHLC\n"
         "/level XAUUSD — yesterday OHLC\n"
-        "/ind XAUUSD 5 — indicator snapshot\n\n"
+        "/ind XAUUSD 5 — indicator snapshot\n"
+        "/trend XAUUSD 5 — trend classification\n\n"
         "<b>Price alerts:</b>\n"
         "/price XAUUSD 2400 — cross alert\n"
         "/price XAUUSD above 2400 — directional\n"
+        "/price sma50 above — indicator crossing\n"
         "/cancel p7 — remove price alert\n"
         "/cancel — cancel all price alerts\n\n"
         "<b>Marks:</b>\n"
@@ -142,7 +144,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — bot health\n"
         "/help — this text\n\n"
         "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
-        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s, /e, /m, /mk, /dt\n"
+        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s, /e, /m, /mk, /dt, /tr\n"
         "<b>Focus pair:</b> set /fp, then /a 5 = /a PAIR 5",
         parse_mode=ParseMode.HTML,
     )
@@ -429,6 +431,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Compute indicators on the current running candle
     ind_snap = None
+    bars = None
     try:
         bars = await mt5_data.bars_n(resolved, tf, 500)
         if bars:
@@ -437,7 +440,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-    text = _format_candle_message(resolved, tf, bar, prev, tick, sinfo, bar.time + tf * 60, time.time(), chat_id, ind_snap=ind_snap)
+    text = _format_candle_message(resolved, tf, bar, prev, tick, sinfo, bar.time + tf * 60, time.time(), chat_id, ind_snap=ind_snap, bars=bars)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -496,21 +499,30 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  /price +50 -30 (relative pips)\n"
             "  /price close 2400 2450 (close range, smart-sorted)\n"
             "  /price close 2400 (cross and close)\n"
-            "  /price 2400 30m (expires in 30 minutes)"
+            "  /price 2400 30m (expires in 30 minutes)\n"
+            "  /price sma50 above (indicator crossing)\n"
+            "  /price bb_lower (indicator, either direction)"
         ))
         return
+
+    from bot.indicators import INDICATOR_TARGETS, indicator_display_label, resolve_indicator_target, compute_all
 
     focus = _get_focus(chat_id)
     resolved = None
     price_args = args
 
-    # Determine if first arg is a symbol (not a number, close, relative, or expiry)
+    # Determine if first arg is a symbol (not a number, close, relative, expiry, or indicator)
     first = args[0]
     is_symbol = False
     try:
         float(first)
     except ValueError:
-        if first.lower() != "close" and not _REL_RE.match(first) and _parse_expiry(first) is None:
+        if (
+            first.lower() != "close"
+            and not _REL_RE.match(first)
+            and _parse_expiry(first) is None
+            and first.lower() not in INDICATOR_TARGETS
+        ):
             is_symbol = True
 
     if is_symbol:
@@ -521,6 +533,9 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         price_args = args[1:]
     elif focus:
         resolved = focus
+    elif first.lower() in INDICATOR_TARGETS:
+        await update.message.reply_text(_err("Usage: /price <symbol> <indicator> [above|below]\nOr set focus with /fp first, then /price sma50 above"))
+        return
     else:
         await update.message.reply_text(_err(
             "Usage: /price <symbol> <price> ...\n"
@@ -530,6 +545,64 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not price_args:
         await update.message.reply_text(_err("No price specified"))
+        return
+
+    # ── Indicator-based price alert ──
+    if price_args[0].lower() in INDICATOR_TARGETS:
+        ind_name = price_args[0].lower()
+        direction = None
+        expiry_s = None
+        expiry_label = None
+        for a in price_args[1:]:
+            if a.lower() in ("above", "below"):
+                direction = a.lower()
+            else:
+                exp = _parse_expiry(a)
+                if exp is not None:
+                    expiry_s, expiry_label = exp
+
+        # Compute the current indicator value to show the user
+        tick = await mt5_data.tick(resolved)
+        if tick is None:
+            await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
+            return
+
+        try:
+            bars = await mt5_data.bars_n(resolved, 1, 500)
+            snap = compute_all(bars, skip_current=False) if bars else None
+        except Exception:
+            snap = None
+
+        current_val = resolve_indicator_target(snap, ind_name) if snap else None
+        if current_val is None:
+            await update.message.reply_text(_err(f"Indicator {ind_name} not available yet (need more bars)"))
+            return
+
+        from datetime import timedelta
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
+
+        # Store with target=0 (placeholder), indicator=ind_name
+        alert = db.add_price_alert(
+            chat_id, resolved, 0.0, direction,
+            alert_type="crossing", expires_at=expires_at,
+            indicator=ind_name,
+        )
+        # Set initial side based on the current indicator value
+        current_side = "above" if tick.bid > current_val else "below"
+        db.update_price_alert(alert.id, last_side=current_side)
+        alert.last_side = current_side
+
+        display = _display_symbol(resolved)
+        label = indicator_display_label(ind_name)
+        dir_str = f" {direction}" if direction else ""
+        exp_str = f" {_fmt_expiry(expires_at)}" if expires_at else ""
+        await update.message.reply_text(
+            f"✅ Indicator alert p{alert.user_seq}{exp_str}\n"
+            f"{display.upper()} cross{dir_str} {label}\n"
+            f"Current {label}: {_fmt_ohlc(current_val, resolved, None)}\n"
+            f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}\n"
+            f"/cancel p{alert.user_seq} to remove"
+        )
         return
 
     # Get tick data
@@ -802,6 +875,19 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await update.message.reply_text(_err(f"Sell stop {entry_price} must be < current {_fmt_price(current, resolved)}"))
                     return
             i += 2
+        elif a in ("tp", "sl") and i + 1 < len(trade_args):
+            # Explicit tp/sl keyword: /entry buy tp sma50 sl bb_lower
+            # or /entry buy tp 2420 sl 2390
+            val = trade_args[i + 1]
+            resolved_price = await _resolve_tp_sl_value(val, resolved, entry_price, pip_size)
+            if resolved_price is None:
+                await update.message.reply_text(_err(f"Invalid {a.upper()} value: {val}"))
+                return
+            if a == "tp":
+                take_profit = resolved_price
+            else:
+                stop_loss = resolved_price
+            i += 2
         elif _REL_RE.match(a):
             pips = float(a[1:])
             price = entry_price + pips * pip_size if a[0] == "+" else entry_price - pips * pip_size
@@ -878,14 +964,22 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         a = mod_args[i].lower()
         if a == "sl" and i + 1 < len(mod_args):
             sl_val = mod_args[i + 1]
-            new_sl = _resolve_relative_price(sl_val, trade.entry_price, pip_size)
+            new_sl = await _resolve_tp_sl_value(sl_val, trade.symbol, trade.entry_price, pip_size)
+            if new_sl is None:
+                await update.message.reply_text(_err(f"Invalid SL value: {sl_val}"))
+                i += 2
+                continue
             db.update_paper_trade(trade.id, stop_loss=new_sl)
             trade.stop_loss = new_sl
             await update.message.reply_text(f"✅ t{user_seq} SL → {_fmt_price(new_sl, trade.symbol)}")
             i += 2
         elif a == "tp" and i + 1 < len(mod_args):
             tp_val = mod_args[i + 1]
-            new_tp = _resolve_relative_price(tp_val, trade.entry_price, pip_size)
+            new_tp = await _resolve_tp_sl_value(tp_val, trade.symbol, trade.entry_price, pip_size)
+            if new_tp is None:
+                await update.message.reply_text(_err(f"Invalid TP value: {tp_val}"))
+                i += 2
+                continue
             db.update_paper_trade(trade.id, take_profit=new_tp)
             trade.take_profit = new_tp
             await update.message.reply_text(f"✅ t{user_seq} TP → {_fmt_price(new_tp, trade.symbol)}")
@@ -906,6 +1000,38 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             i += 1  # skip unknown
 
 
+
+
+async def _resolve_tp_sl_value(
+    val: str,
+    symbol: str,
+    base_price: float,
+    pip_size: float,
+) -> Optional[float]:
+    """Resolve a TP/SL value to an absolute price.
+
+    Supports:
+      - Indicator names: "sma50", "bb_upper", "bb_lower", "bb_middle", "ema20"
+        → resolved from the current M1 indicator snapshot
+      - Relative pips: "+20", "-10" → base_price ± pips
+      - Absolute prices: "2420.50" → 2420.50
+
+    Returns None if the value cannot be resolved.
+    """
+    from bot.indicators import INDICATOR_TARGETS, resolve_indicator_target, compute_all
+
+    val_lower = val.lower()
+    if val_lower in INDICATOR_TARGETS:
+        try:
+            bars = await mt5_data.bars_n(symbol, 1, 500)
+            if not bars:
+                return None
+            snap = compute_all(bars, skip_current=False)
+            return resolve_indicator_target(snap, val_lower)
+        except Exception:
+            return None
+
+    return _resolve_relative_price(val, base_price, pip_size)
 
 
 async def _calc_unrealized(trade: "PaperTrade", chat_id: int) -> float:
@@ -929,7 +1055,7 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     VALID_PREFS = {
         "show_pattern", "show_ohlc", "show_range_body", "show_bid_ask",
-        "show_marks", "show_indicators",
+        "show_marks", "show_indicators", "show_trend", "show_progression",
         "show_sma", "show_ema", "show_bb", "show_atr", "show_rsi", "show_adx",
     }
 
@@ -1142,6 +1268,64 @@ async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     report = format_indicator_full(snap, symbol, sinfo)
 
     await update.message.reply_text(f"{header}\n\n{report}")
+
+
+async def cmd_trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show trend classification. /trend [SYMBOL] [TF] [LOOKBACK]"""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        # /trend with no args: if fp is active, default to M5, lookback 20
+        focus = _get_focus(chat_id)
+        if focus:
+            symbol = focus
+            tf_raw = "5"
+            lookback = 20
+        else:
+            await update.message.reply_text(_err(
+                "Usage: /trend [SYMBOL] [TIMEFRAME] [LOOKBACK]\n"
+                "Example: /trend xauusd 5 10\n"
+                "Or set focus with /fp first, then /trend 5"
+            ))
+            return
+    else:
+        # First arg could be a symbol or a timeframe
+        resolved = await mt5_data.resolve_symbol(args[0])
+        if resolved:
+            symbol = resolved
+            tf_raw = args[1] if len(args) > 1 else "5"
+            lookback = int(args[2]) if len(args) > 2 else 20
+        else:
+            # Not a symbol — treat args[0] as a timeframe (needs focus pair)
+            focus = _get_focus(chat_id)
+            if not focus:
+                await update.message.reply_text(_err(
+                    f"Symbol '{args[0]}' not found.\n"
+                    "Usage: /trend [SYMBOL] [TIMEFRAME] [LOOKBACK]\n"
+                    "Or set focus with /fp first, then /trend 5"
+                ))
+                return
+            symbol = focus
+            tf_raw = args[0]
+            lookback = int(args[1]) if len(args) > 1 else 20
+
+    tf_min = parse_tf(tf_raw)
+    if tf_min is None:
+        await update.message.reply_text(_err(f"Unknown timeframe: {tf_raw}"))
+        return
+
+    # Fetch tick + bars
+    sinfo = await mt5_data.symbol_info(symbol)
+    bars = await mt5_data.bars_n(symbol, tf_min, 500)
+    if not bars:
+        await update.message.reply_text(_err("No bar data available"))
+        return
+
+    from bot.indicators import format_trend_full
+
+    text = format_trend_full(bars, symbol, sinfo, lookback)
+    await update.message.reply_text(text)
 
 
 # ============================================================

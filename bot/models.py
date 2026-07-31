@@ -36,6 +36,7 @@ class PriceAlert:
     enabled: bool = True
     last_side: Optional[str] = None
     expires_at: Optional[str] = None  # ISO timestamp, None = indefinite
+    indicator: Optional[str] = None  # None = static price; "sma50","ema20","bb_upper","bb_lower","bb_middle" = dynamic
     created_at: str = ""
 
 

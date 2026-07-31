@@ -215,6 +215,7 @@ async def _send_group(
         tick = None
         sinfo = None
         ind_snap = None
+        bars = None
 
     for alert in g["alerts"]:
         alert_key = f"{symbol or 'timer'}:{tf_min}"
@@ -235,6 +236,7 @@ async def _send_group(
                 close_epoch=close_epoch,
                 sent_epoch=sent_epoch,
                 ind_snap=ind_snap,
+                bars=bars,
             )
         except Exception:
             logger.exception("Failed to send candle alert to chat %d", alert.chat_id)
@@ -269,9 +271,70 @@ async def _process_price_alerts(
             if prev_bar:
                 prev_close = prev_bar.close
 
+        # For indicator-based alerts, compute a snapshot once per symbol per cycle.
+        # We use M1 bars as a sensible default timeframe for the dynamic target —
+        # the indicator value moves with each M1 close.
+        ind_snap = None
+        indicator_alerts = [a for a in alerts if a.symbol == symbol and a.indicator]
+        if indicator_alerts:
+            try:
+                bars = await mt5_data.bars_n(symbol, 1, 500)
+                if bars:
+                    ind_snap = indicators.compute_all(bars, skip_current=False)
+            except Exception:
+                logger.debug("Indicator snapshot failed for %s", symbol)
+
         for alert in alerts:
             if alert.symbol != symbol:
                 continue
+
+            # ── indicator-based crossing alert ──
+            # The target is dynamic: resolved from the indicator snapshot each cycle.
+            if alert.indicator:
+                if ind_snap is None:
+                    continue
+                dynamic_target = indicators.resolve_indicator_target(ind_snap, alert.indicator)
+                if dynamic_target is None:
+                    continue  # indicator not available yet (e.g. not enough bars)
+
+                # Use the dynamic target instead of the stored static target
+                alert_target = dynamic_target
+                current_side = "above" if price > alert_target else "below"
+
+                if alert.last_side is None:
+                    db.update_price_alert(alert.id, last_side=current_side)
+                    alert.last_side = current_side
+                    continue
+
+                if alert.last_side != current_side:
+                    triggered = False
+                    if alert.direction is None:
+                        triggered = True
+                    elif alert.direction == "above" and current_side == "above":
+                        triggered = True
+                    elif alert.direction == "below" and current_side == "below":
+                        triggered = True
+
+                    if triggered:
+                        # Stash the resolved target on the alert for the message
+                        alert.target = alert_target
+                        try:
+                            await send_price(
+                                chat_id=alert.chat_id,
+                                alert=alert,
+                                price=price,
+                                tick=tick,
+                            )
+                        except Exception:
+                            logger.exception("Failed to send indicator alert to chat %d", alert.chat_id)
+
+                        if not alert.repeat:
+                            db.update_price_alert(alert.id, enabled=False)
+                            alert.enabled = False
+
+                    db.update_price_alert(alert.id, last_side=current_side)
+                    alert.last_side = current_side
+                continue  # indicator alerts handled, skip static logic
 
             if alert.alert_type == "close":
                 if prev_close is None:

@@ -1,10 +1,49 @@
 # ta-bot Feature Expansion — Implementation Plan
 
+> **Status (updated 2025-08-01):** Phases 1–3 are COMPLETE and live — including Tasks 9 & 10, which were previously skipped. All indicator calculation work is closed. The plan below is retained as the original design spec; see the **Progress Log** below for what actually shipped and deviations from the plan.
+
 > **Goal:** Add 10 features (engulf fix → trend classification) to the Telegram trading alert bot, in dependency order, without breaking existing functionality.
 
 **Architecture:** Same stack — `python-telegram-bot` v20+, `MetaTrader5`, SQLite/WAL, wall-clock UTC scheduling. New `bot/indicators.py` and `bot/parser.py` modules. New DB tables for marks, paper entries, user prefs. MessageHandler for dot-prefix commands. Flexible argument parser for pip-based inputs.
 
 **Tech Stack:** Python 3.11+, python-telegram-bot[job-queue]>=20.0, MetaTrader5>=5.0.45, numpy>=2.2, pyyaml>=6.0
+
+---
+
+## Progress Log
+
+### ✅ Phase 1 — Independent Features (COMPLETE)
+- **Task 1 (Bear engulf fix):** Done — body_ratio ≥ 0.05 guard added.
+- **Task 2 (MessageHandler dot-commands):** Done — `.add`, `.d`, `.p`, etc. all work.
+- **Task 3 (TW/BW in alerts):** Done — Range+Body line includes TW/BW.
+- **Task 4 (Modular data):** Done — `user_prefs` table, `/data` command, conditional formatting. Extended beyond plan: `show_indicators` + granular indicator prefs (`show_bb`, `show_sma`, `show_ema`, `show_atr`, `show_rsi`, `show_adx`).
+- **Task 5 (Mark feature):** Done — `/mark`, `/mkd`, `/mkl`, inline marks in candle alerts with pip distance, expiry support.
+
+### ✅ Phase 2 — Extended Features (COMPLETE)
+- **Task 6 (Stronger price alert):** Done — close-range alerts, `+N`/`-N` relative pips, expiration. Parser kept inline in `parsing.py` (no separate `bot/parser.py` module — simpler as the plan's revised approach suggested).
+- **Task 7 (Paper trade entry):** Done — `/entry` (market/limit/stop), `/modify` (sl/tp/close), auto-monitoring via `_paper_trade_loop`, PnL in pips. Uses `paper_trades` table (not `paper_entries`), `order_type` transitions limit/stop → market on activation.
+
+### ✅ Phase 3 — Indicator Features (COMPLETE)
+- **Task 8 (Indicator data):** Done — `bot/indicators.py` with BB(20,2), SMA50, EMA20, ATR(14), RSI(14), ADX(14). **Deviations from plan:** VWAP and Relative Volume were removed during alignment. BB uses population std (`ddof=0`). EMA20 seeded with SMA of first 20 closes. ATR uses Wilder's smoothing (fixed double-discard bug). ADX uses Wilder's `alpha=1/period` to match MT5 ADXW. 27/27 synthetic tests pass.
+- **`format_indicator_section`:** 5-line layout (not 2-line as planned): BB → SMA50+EMA20 → ATR → RSI → ADX. BB bands separated by `-`, width+pct together (`27.9p-0.3%`). ATR/RSI values separated by `-` (no spaces). ATR gets `expanding`/`compressing`/`flat` note. RSI gets `OB`/`OS` zone. ADX gets `strong`/`present` strength + `+DI`/`-DI`.
+- **`show_indicators` default:** Changed from `"off"` to `"on"` in `formatting.py:133` — was the root cause of indicators not appearing in candle alerts.
+- **Offset=0 indicator alignment fix:** Scheduler now passes `skip_current=new_bar_appeared` to `compute_all`. When MT5 hasn't rolled to a new bar yet at offset=0, position-0 IS the just-closed candle and must NOT be skipped. Previously `skip_current=True` was hardcoded, causing indicators to show the candle before the just-closed one.
+- **`/now` and `/ind`:** Both now show the current running candle (position 0, `skip_current=False`) instead of the previous completed bar. `/now` also passes `ind_snap` so indicators appear.
+- **Task 9 (Indicator-based price alerts):** Done — `/price sma50 above`, `/price bb_lower`, etc. `PriceAlert` model extended with `indicator` field (DB migration adds `indicator TEXT` column). Scheduler computes M1 indicator snapshot per symbol per cycle and resolves dynamic targets. `format_price_alert_message` shows indicator label + resolved price. **Extension beyond plan:** indicator mechanics also reusable in `/entry` and `/modify` for TP/SL — e.g. `/entry buy tp sma50 sl bb_lower`, `/modify t1 tp ema20`. New `_resolve_tp_sl_value()` async helper resolves indicator names (sma50, ema20, bb_upper, bb_lower, bb_middle) to absolute prices via M1 snapshot.
+- **Task 10 (Trend characteristic):** Done — `/trend [SYMBOL] [TF] [LOOKBACK]` command (default M5, lookback 20). `classify_trend()` uses linear regression slope with adaptive 0.02% threshold → UP/DOWN/SIDEWAYS. `format_trend_full()` shows direction + slope + ATR/RSI/ADX context + price vs SMA50 + BB zone. `format_trend_section()` compact one-liner in candle alerts when `show_trend` pref is on. `bars` parameter threaded through `_send_candle` → `format_candle_message` from scheduler.
+- **Task 11 (GUI interaction):** Skipped as planned.
+
+### Extension: Progression Display
+- **Running paper trades, live alerts, and marks** now show inline progression in candle alerts and `/now` when `show_progression` pref is on (default on). Shows floating PnL for ongoing market orders (not limit/stop), distance to price alert targets (including indicator-based), and mark distances. Configurable via `/data on|off show_progression`.
+
+### Key Deviations Summary
+1. **No `bot/parser.py` module** — parsing kept inline in `parsing.py`.
+2. **VWAP + RelVol removed** from indicators during alignment with MT5.
+3. **`format_indicator_section` is 5-line**, not 2-line as originally planned.
+4. **`show_indicators` default is `"on"`**, not `"off"`.
+5. **Scheduler `skip_current` is dynamic** (`new_bar_appeared`), not hardcoded `True`.
+6. **`/now` and `/ind` show current running candle**, not previous completed bar.
+7. **Paper trades table** is `paper_trades` (not `paper_entries`), with `order_type` transition logic.
 
 ---
 

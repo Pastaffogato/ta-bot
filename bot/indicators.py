@@ -602,3 +602,218 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
         parts.append(f"Close: {fmt_ohlc(snap.current_close, symbol, sinfo)}")
 
     return "\n".join(parts)
+
+
+# ── indicator target resolution (Task 9) ──
+
+# Map indicator names → (IndicatorSnapshot attribute, display label)
+INDICATOR_TARGETS: dict[str, tuple[str, str]] = {
+    "sma50": ("sma50", "SMA50"),
+    "ema20": ("ema20", "EMA20"),
+    "bb_upper": ("bb_upper", "BB Upper"),
+    "bb_lower": ("bb_lower", "BB Lower"),
+    "bb_middle": ("bb_middle", "BB Middle"),
+}
+
+
+def resolve_indicator_target(snap: "IndicatorSnapshot", name: str) -> Optional[float]:
+    """Resolve a dynamic indicator target from a snapshot.
+
+    Returns the indicator value (a price), or None if the indicator is
+    unknown or unavailable in this snapshot.
+
+    Usable by price alerts, marks, and paper-trade TP/SL — anywhere a
+    price level can be expressed as an indicator name.
+    """
+    entry = INDICATOR_TARGETS.get(name.lower())
+    if entry is None:
+        return None
+    attr, _label = entry
+    val = getattr(snap, attr, None)
+    return float(val) if val is not None else None
+
+
+def indicator_display_label(name: str) -> str:
+    """Human-readable label for an indicator target name."""
+    entry = INDICATOR_TARGETS.get(name.lower())
+    if entry is None:
+        return name
+    return entry[1]
+
+
+# ── trend classification (Task 10) ──
+
+
+@dataclass
+class TrendResult:
+    """Result of trend classification over a lookback window."""
+
+    direction: str  # "UP", "DOWN", "SIDEWAYS"
+    slope: Optional[float] = None  # price change per bar (from linear regression)
+    lookback: int = 0
+    bar_count: int = 0
+    snap: Optional["IndicatorSnapshot"] = None
+
+
+def classify_trend(bars: list, lookback: int = 20) -> TrendResult:
+    """Classify the trend over the last `lookback` bars using linear regression slope.
+
+    `bars` must be newest-first (as returned by mt5_data.bars_n).
+    Uses the closes of the last `lookback` bars (chronological order).
+    Threshold is adaptive: 0.02% of price per bar → trending, else sideways.
+
+    Returns a TrendResult with direction + slope + indicator snapshot.
+    """
+    if not bars or lookback < 3:
+        return TrendResult(direction="SIDEWAYS", lookback=lookback, bar_count=len(bars) if bars else 0)
+
+    # Take the last `lookback` bars, reverse to chronological (oldest first)
+    chunk = bars[:lookback]
+    chunk.reverse()
+    closes = np.array([b.close for b in chunk], dtype=np.float64)
+    n = len(closes)
+    if n < 3:
+        return TrendResult(direction="SIDEWAYS", lookback=lookback, bar_count=n)
+
+    # Linear regression slope: closes vs index [0, 1, ..., n-1]
+    x = np.arange(n, dtype=np.float64)
+    x_mean = np.mean(x)
+    y_mean = np.mean(closes)
+    # slope = sum((x-xm)(y-ym)) / sum((x-xm)^2)
+    denom = np.sum((x - x_mean) ** 2)
+    if denom == 0:
+        return TrendResult(direction="SIDEWAYS", slope=0.0, lookback=lookback, bar_count=n)
+    slope = float(np.sum((x - x_mean) * (closes - y_mean)) / denom)
+
+    # Adaptive threshold: 0.02% of mean price per bar
+    threshold = abs(y_mean) * 0.0002 if y_mean != 0 else 0.0
+    if slope > threshold:
+        direction = "UP"
+    elif slope < -threshold:
+        direction = "DOWN"
+    else:
+        direction = "SIDEWAYS"
+
+    # Compute indicator snapshot on these bars for supplementary context
+    snap = compute_all(bars, skip_current=False)
+
+    return TrendResult(
+        direction=direction,
+        slope=slope,
+        lookback=lookback,
+        bar_count=n,
+        snap=snap,
+    )
+
+
+def format_trend_section(bars: list, symbol: str, sinfo, lookback: int = 20) -> str:
+    """Build a compact one-line trend summary for candle alerts.
+
+    Format: Trend: UP  ATR compressing  RSI 54.2
+    Returns empty string if insufficient data.
+    """
+    if not bars:
+        return ""
+    result = classify_trend(bars, lookback)
+    if result.bar_count < 3:
+        return ""
+
+    from bot.formatting import fmt_ohlc
+
+    arrow = {"UP": "📈", "DOWN": "📉", "SIDEWAYS": "↔"}.get(result.direction, "↔")
+    parts = [f"Trend: {arrow} {result.direction}"]
+
+    snap = result.snap
+    if snap:
+        # ATR compression note
+        if snap.atr is not None and snap.atr_prev is not None:
+            if snap.atr > snap.atr_prev:
+                parts.append("ATR expanding")
+            elif snap.atr < snap.atr_prev:
+                parts.append("ATR compressing")
+            else:
+                parts.append("ATR flat")
+        # RSI value
+        if snap.rsi is not None:
+            zone = ""
+            if snap.rsi > 70:
+                zone = " OB"
+            elif snap.rsi < 30:
+                zone = " OS"
+            parts.append(f"RSI {snap.rsi:.0f}{zone}")
+
+    return "  ".join(parts)
+
+
+def format_trend_full(bars: list, symbol: str, sinfo, lookback: int = 20) -> str:
+    """Build a full trend report for the /trend command."""
+    if not bars:
+        return "No bar data available"
+
+    result = classify_trend(bars, lookback)
+    if result.bar_count < 3:
+        return f"Insufficient data: only {result.bar_count} bars (need ≥3)"
+
+    from bot.formatting import fmt_ohlc, display_symbol
+
+    disp = display_symbol(symbol)
+    arrow = {"UP": "📈", "DOWN": "📉", "SIDEWAYS": "↔"}.get(result.direction, "↔")
+
+    lines = [f"{arrow} {disp.upper()} — {result.direction}"]
+    lines.append(f"Lookback: {result.lookback} bars (slope {result.slope:+.4f}/bar)")
+
+    snap = result.snap
+    if snap:
+        lines.append("")
+        if snap.atr is not None:
+            note = ""
+            if snap.atr_prev is not None:
+                if snap.atr > snap.atr_prev:
+                    note = " (expanding)"
+                elif snap.atr < snap.atr_prev:
+                    note = " (compressing)"
+                else:
+                    note = " (flat)"
+            pct = f" ({snap.atr_pct:.2f}%)" if snap.atr_pct else ""
+            lines.append(f"ATR(14): {fmt_ohlc(snap.atr, symbol, sinfo)}{note}{pct}")
+
+        if snap.rsi is not None:
+            zone = ""
+            if snap.rsi > 70:
+                zone = " (overbought)"
+            elif snap.rsi < 30:
+                zone = " (oversold)"
+            rsi_str = f"{snap.rsi:.1f}"
+            if snap.rsi_prev is not None:
+                rsi_str += f" - {snap.rsi_prev:.1f}"
+            lines.append(f"RSI(14): {rsi_str}{zone}")
+
+        if snap.adx is not None:
+            strength = "strong trend" if snap.adx > 50 else ("trending" if snap.adx > 25 else "weak/ranging")
+            di_str = ""
+            if snap.di_plus is not None and snap.di_minus is not None:
+                di_str = f" | +DI: {snap.di_plus:.1f} -DI: {snap.di_minus:.1f}"
+            lines.append(f"ADX(14): {snap.adx:.1f}{di_str} — {strength}")
+
+        # Price vs SMA50
+        if snap.sma50 is not None and snap.current_close is not None:
+            pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+            dist_pips = (snap.current_close - snap.sma50) / pip_size if pip_size > 0 else 0
+            rel = "above" if dist_pips >= 0 else "below"
+            sign = "+" if dist_pips >= 0 else ""
+            lines.append(f"Price {rel} SMA50 ({sign}{dist_pips:.1f}p)")
+
+        # Price vs BB
+        if snap.bb_upper is not None and snap.bb_lower is not None and snap.current_close is not None:
+            bb_range = snap.bb_upper - snap.bb_lower
+            if bb_range > 0:
+                pos = (snap.current_close - snap.bb_lower) / bb_range
+                if pos >= 0.75:
+                    zone = "upper zone"
+                elif pos <= 0.25:
+                    zone = "lower zone"
+                else:
+                    zone = "middle zone"
+                lines.append(f"BB: {zone}")
+
+    return "\n".join(lines)
