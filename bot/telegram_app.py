@@ -583,8 +583,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    candle_count = len(db.get_candle_alerts())
-    price_count = len(db.get_price_alerts())
+    candle_count = len(db.get_candle_alerts(chat_id))
+    price_count = len(db.get_price_alerts(chat_id))
     focus = _get_focus(chat_id)
 
     lines = [
@@ -617,14 +617,24 @@ def _format_candle_message(
     """Build the candle alert message."""
     display = _display_symbol(symbol) if symbol else "timer"
 
-    # Header: ⏳ SYMBOL TF (bid)
+    pat = patterns.classify(bar, prev_bar) if bar else None
+
+    # Header: EMOJI SYMBOL TF BID +PIPS
     bid_str = _fmt_ohlc(tick.bid, symbol, sinfo) if tick else "—"
-    lines = [f"⏳ {display.upper()} {tf_label(tf_min)} ({bid_str})"]
+    emoji = pat.emoji if pat else "⏳"
+    pip_change = ""
+    if bar and tick and sinfo and prev_bar:
+        point_size = sinfo.point
+        if point_size > 0:
+            pip_size = point_size * 10  # 1 pip = 10 points for forex
+            change_pips = (tick.bid - prev_bar.close) / pip_size
+            sign = "+" if change_pips >= 0 else ""
+            pip_change = f" {sign}{change_pips:.1f}p"
+    lines = [f"{emoji} {display.upper()} {tf_label(tf_min)} {bid_str}{pip_change}"]
 
     if bar:
         # Pattern
-        pat = patterns.classify(bar, prev_bar)
-        lines.append(f"{pat.emoji} {pat.label}")
+        lines.append(f"{pat.label}")
         # OHLC
         lines.append(
             f"O {_fmt_ohlc(bar.open, symbol, sinfo)}  "
