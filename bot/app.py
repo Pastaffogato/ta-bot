@@ -12,7 +12,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from bot import config, scheduler
+from bot import config, scheduler, signal_broadcast
 from bot.formatting import (
     display_symbol,
     format_candle_message,
@@ -81,6 +81,16 @@ async def _send_error(chat_id: int, msg: str) -> None:
             pass
 
 
+async def _send_signal(chat_id: int, text: str) -> None:
+    """Called by the signal broadcast loop to deliver one EA [SIGNAL] block.
+
+    Text is the EA's message verbatim (opaque — never parsed). Per-user error
+    handling lives in signal_broadcast._fan_out.
+    """
+    if _app_ref:
+        await _app_ref.bot.send_message(chat_id=chat_id, text=text)
+
+
 async def _send_paper_trade(
     chat_id: int,
     trade,
@@ -143,7 +153,7 @@ def build_app() -> Application:
         cmd_add, cmd_cancel, cmd_clear, cmd_data,
         cmd_del, cmd_entry, cmd_focus_pair, cmd_help,
         cmd_indicator, cmd_level, cmd_list, cmd_mark, cmd_mark_del, cmd_mark_list,
-        cmd_modify, cmd_now, cmd_offset, cmd_price, cmd_status, cmd_trend,
+        cmd_modify, cmd_now, cmd_offset, cmd_price, cmd_signals, cmd_status, cmd_trend,
     )
 
     app = Application.builder().token(config.BOT_TOKEN).build()
@@ -172,6 +182,7 @@ def build_app() -> Application:
         ("modify", cmd_modify), ("m", cmd_modify),
         ("indicator", cmd_indicator), ("ind", cmd_indicator),
         ("trend", cmd_trend), ("tr", cmd_trend),
+        ("signals", cmd_signals),
     ]
 
     for name, func in handlers:
@@ -183,11 +194,15 @@ def build_app() -> Application:
         filters.TEXT & filters.Regex(r'^\.\w+'), _handle_dot_command
     ))
 
-    # Start scheduler in background
+    # Start scheduler + EA signal tail in background
     async def post_init(app: Application):
         asyncio.create_task(
             scheduler.scheduler_loop(_send_candle, _send_price, _send_error, _send_paper_trade),
             name="scheduler",
+        )
+        asyncio.create_task(
+            signal_broadcast.signal_loop(_send_signal),
+            name="signal_broadcast",
         )
 
     app.post_init = post_init

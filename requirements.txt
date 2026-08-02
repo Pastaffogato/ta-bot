@@ -1,4 +1,4 @@
 python-telegram-bot[job-queue]>=20.0,<22
 MetaTrader5>=5.0.45
-numpy>=2.2
+numpy==1.26.4  # MetaTrader5 package incompatible with numpy>=2.x
 pyyaml>=6.0

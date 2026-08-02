@@ -82,6 +82,11 @@ def init_db() -> None:
             PRIMARY KEY (chat_id, key)
         );
 
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS marks (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id    INTEGER NOT NULL REFERENCES users(chat_id),
@@ -364,6 +369,35 @@ def set_user_pref(chat_id: int, key: str, value: str) -> None:
             "INSERT OR REPLACE INTO user_prefs (chat_id, key, value) VALUES (?, ?, ?)",
             (chat_id, key, value),
         )
+
+
+# ---- global key-value meta (e.g. EA file-tail offset) ----
+
+def get_meta(key: str) -> Optional[str]:
+    """Read a global key-value setting (e.g. 'ea_signal_offset')."""
+    row = _conn().execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(key: str, value: str) -> None:
+    """Write a global key-value setting."""
+    with _tx() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+
+# ---- EA signal fan-out (user_prefs key 'ea_signals'; absent pref = on) ----
+
+def get_ea_signal_recipients() -> list[int]:
+    """Chat_ids opted into EA signal broadcasts: no pref row (default on) or 'on'."""
+    rows = _conn().execute(
+        "SELECT u.chat_id FROM users u"
+        " LEFT JOIN user_prefs p ON p.chat_id = u.chat_id AND p.key = 'ea_signals'"
+        " WHERE p.value IS NULL OR p.value = 'on'"
+    ).fetchall()
+    return [r["chat_id"] for r in rows]
 
 
 # ---- marks ----

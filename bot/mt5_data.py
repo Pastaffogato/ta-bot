@@ -80,6 +80,15 @@ async def shutdown() -> None:
     logger.info("MT5 shutdown")
 
 
+async def terminal_data_path() -> Optional[str]:
+    """Terminal data folder. The EA's file sandbox lives under
+    <data_path>\\MQL5\\Files\\ (ea_signals.txt file bridge)."""
+    info = await _call_mt5(mt5.terminal_info)
+    if info is None:
+        return None
+    return getattr(info, "data_path", None) or None
+
+
 async def health() -> dict:
     """Return connection + account summary for /status."""
     try:

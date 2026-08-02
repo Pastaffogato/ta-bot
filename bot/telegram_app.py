@@ -142,6 +142,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/modify t1 close — close at market\n\n"
         "<b>Other:</b>\n"
         "/data — toggle OHLC + indicator sections\n"
+        "/signals [on|off] — EA signal broadcast opt-in (bare = status)\n"
         "/clear — clear all alerts + marks\n"
         "/status — bot health\n"
         "/help — this text\n\n"
@@ -772,6 +773,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if focus:
         lines.append(f"Focus pair: {_display_symbol(focus).upper()}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/signals [on|off] — EA signal broadcast opt-in (default: on). Bare command = status."""
+    chat_id = update.effective_chat.id
+    db.ensure_user(chat_id)
+    arg = (context.args or [""])[0].lower()
+
+    if arg == "on":
+        db.set_user_pref(chat_id, "ea_signals", "on")
+        await update.message.reply_text("signals: on")
+    elif arg == "off":
+        db.set_user_pref(chat_id, "ea_signals", "off")
+        await update.message.reply_text("signals: off")
+    else:
+        # bare command (or unknown arg) = status; no recipient count
+        state = "off" if db.get_user_prefs(chat_id).get("ea_signals") == "off" else "on"
+        await update.message.reply_text(f"signals: {state}")
 
 
 async def cmd_mark_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

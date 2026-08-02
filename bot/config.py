@@ -35,6 +35,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # ---- mt5 ----
 MT5_TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH", None)  # None = use default
 
+# ---- ea file bridge ----
+# Optional override for the EA signal file. Default (None) = derive from MT5:
+# <terminal data_path>\MQL5\Files\ea_signals.txt
+EA_SIGNAL_FILE = os.environ.get("EA_SIGNAL_FILE") or None
+
 # ---- logging ----
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
