@@ -580,7 +580,7 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
 
 
 def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
-    """Build a full indicator report for /ind command."""
+    """Build a full indicator report for /ind command (lean: current values only)."""
     from bot.formatting import fmt_ohlc
 
     pip_size = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
@@ -590,62 +590,58 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
     if snap.bar_count > 0:
         parts.append(f"Bars: {snap.bar_count}")
 
+    # Moves — one line
+    sma_ema = []
     if snap.sma50 is not None:
-        parts.append(f"SMA(50): {fmt_ohlc(snap.sma50, symbol, sinfo)}")
+        sma_ema.append(f"SMA(50): {fmt_ohlc(snap.sma50, symbol, sinfo)}")
     if snap.ema20 is not None:
-        parts.append(f"EMA(20): {fmt_ohlc(snap.ema20, symbol, sinfo)}")
+        sma_ema.append(f"EMA(20): {fmt_ohlc(snap.ema20, symbol, sinfo)}")
+    if sma_ema:
+        parts.append("  ".join(sma_ema))
 
+    # BB — bands + %b + width + pctile on one line
     if snap.bb_upper is not None:
-        bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
-        parts.append(
-            f"BB(20,2): {fmt_ohlc(snap.bb_upper, symbol, sinfo)} — "
-            f"{fmt_ohlc(snap.bb_middle, symbol, sinfo)} — "
+        bb_parts = [
+            f"BB(20,2): {fmt_ohlc(snap.bb_upper, symbol, sinfo)} / "
+            f"{fmt_ohlc(snap.bb_middle, symbol, sinfo)} / "
             f"{fmt_ohlc(snap.bb_lower, symbol, sinfo)}"
-        )
-        width_line = f"  Width: {bb_width_pips:.1f}p"
-        if snap.bb_width_pct:
-            width_line += f" ({snap.bb_width_pct:.1f}%)"
+        ]
+        bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
         if snap.bb_percent_b is not None:
-            width_line += f"  %b {snap.bb_percent_b:.1f}"
+            bb_parts.append(f"%b {snap.bb_percent_b:.1f}")
+        bb_parts.append(f"W {bb_width_pips:.1f}p")
         if snap.bb_width_pctile is not None:
-            width_line += f"  Wpct {snap.bb_width_pctile:.0f}"
-        parts.append(width_line)
+            bb_parts.append(f"Wpct {snap.bb_width_pctile:.0f}")
+        parts.append("  ".join(bb_parts))
 
+    # ATR/ADX — current values only, one line (no 3-value list, no +DI/-DI, no status)
+    atr_adx = []
+    if snap.tr_ratio is not None:
+        atr_adx.append(f"TR/ATR {snap.tr_ratio:.2f}")
     if snap.atr is not None:
-        atr_now = fmt_ohlc(snap.atr, symbol, sinfo)
-        pct_str = f" ({snap.atr_pct:.2f}%)" if snap.atr_pct else ""
-        prev_str = ""
-        if snap.atr_prev is not None:
-            prev_str += f" - {fmt_ohlc(snap.atr_prev, symbol, sinfo)}"
-        if snap.atr_prev2 is not None:
-            prev_str += f" - {fmt_ohlc(snap.atr_prev2, symbol, sinfo)}"
-        ratio_str = f"  TR/ATR {snap.tr_ratio:.2f}" if snap.tr_ratio is not None else ""
-        parts.append(f"ATR(14): {atr_now}{prev_str}{pct_str}{ratio_str}")
+        atr_adx.append(f"ATR(14): {fmt_ohlc(snap.atr, symbol, sinfo)}")
+    if snap.adx is not None:
+        atr_adx.append(f"ADX(14): {snap.adx:.1f}")
+    if atr_adx:
+        parts.append("  ".join(atr_adx))
 
+    # RSI — current value only
     if snap.rsi is not None:
-        rsi_str = f"{snap.rsi:.1f}"
-        if snap.rsi_prev is not None:
-            rsi_str += f" - {snap.rsi_prev:.1f}"
-        if snap.rsi_prev2 is not None:
-            rsi_str += f" - {snap.rsi_prev2:.1f}"
         zone = ""
         if snap.rsi > 70:
             zone = " (overbought)"
         elif snap.rsi < 30:
             zone = " (oversold)"
-        parts.append(f"RSI(14): {rsi_str}{zone}")
+        parts.append(f"RSI(14): {snap.rsi:.1f}{zone}")
 
-    if snap.adx is not None:
-        strength = "strong trend" if snap.adx > 50 else ("trending" if snap.adx > 25 else "weak/ranging")
-        di_str = ""
-        if snap.di_plus is not None and snap.di_minus is not None:
-            di_str = f" | +DI: {snap.di_plus:.1f} | -DI: {snap.di_minus:.1f}"
-        parts.append(f"ADX(14): {snap.adx:.1f}{di_str} — {strength}")
-
+    # ER/CHOP — one line
+    er_chop = []
     if snap.er14 is not None:
-        parts.append(f"ER(14): {snap.er14 * 100:.1f}")
+        er_chop.append(f"ER(14): {snap.er14 * 100:.1f}")
     if snap.chop14 is not None:
-        parts.append(f"CHOP(14): {snap.chop14:.1f}")
+        er_chop.append(f"CHOP(14): {snap.chop14:.1f}")
+    if er_chop:
+        parts.append("  ".join(er_chop))
 
     if snap.current_close is not None:
         parts.append(f"Close: {fmt_ohlc(snap.current_close, symbol, sinfo)}")

@@ -116,6 +116,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/now XAUUSD 3 — live M3 OHLC\n"
         "/level XAUUSD — yesterday OHLC\n"
         "/ind XAUUSD 5 — indicator snapshot\n"
+        "/indtf XAUUSD sma50 — one indicator on M1/M3/M5/M15/M30/H1\n"
+        "/indtf XAUUSD bb — BB bands, %b, width, Wpct per TF\n"
         "/trend XAUUSD 5 — trend classification\n\n"
         "<b>Price alerts:</b>\n"
         "/price XAUUSD 2400 — cross alert\n"
@@ -147,7 +149,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — bot health\n"
         "/help — this text\n\n"
         "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
-        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s, /e, /m, /mk, /dt, /tr\n"
+        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s, /e, /m, /mk, /dt, /tr, /itf, /indtf\n"
         "<b>Focus pair:</b> set /fp, then /a 5 = /a PAIR 5",
         parse_mode=ParseMode.HTML,
     )
@@ -1347,10 +1349,10 @@ async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 _IND_TF_REGISTRY: dict[str, tuple[str, str]] = {
     "sma50": ("sma50", "price"),
     "ema20": ("ema20", "price"),
-    "bb": ("bb_percent_b", "pct"),
-    "bb_b": ("bb_percent_b", "pct"),
-    "bb_width": ("bb_width_pct", "pct"),
-    "bb_pctile": ("bb_width_pctile", "pct"),
+    "bb": ("bb", "bb_full"),
+    "bb_b": ("bb", "bb_full"),
+    "bb_width": ("bb", "bb_full"),
+    "bb_pctile": ("bb", "bb_full"),
     "rsi": ("rsi", "idx"),
     "adx": ("adx", "idx"),
     "tratr": ("tr_ratio", "ratio"),
@@ -1363,6 +1365,7 @@ _IND_TF_REGISTRY: dict[str, tuple[str, str]] = {
 }
 
 _DEFAULT_IND_TFS = [1, 3, 5, 15, 30, 60]
+_IND_TF_SUMMARY = "bb (bands+%b+W+Wpct), sma50, ema20, rsi, adx, tratr (TR/ATR), er, chop"
 
 
 async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1373,7 +1376,7 @@ async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not args:
         await update.message.reply_text(_err(
             "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
-            "Indicators: " + ", ".join(sorted(_IND_TF_REGISTRY)) + "\n"
+            "Indicators: " + _IND_TF_SUMMARY + "\n"
             "Example: /indtf XAUUSD rsi 5 15\n"
             "Or set focus with /fp first, then /indtf rsi 15"
         ))
@@ -1397,7 +1400,7 @@ async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if not rest:
         await update.message.reply_text(_err(
-            "Missing indicator.\nValid: " + ", ".join(sorted(_IND_TF_REGISTRY))
+            "Missing indicator.\nValid: " + _IND_TF_SUMMARY
         ))
         return
 
@@ -1405,7 +1408,7 @@ async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     entry = _IND_TF_REGISTRY.get(ind_key)
     if entry is None:
         await update.message.reply_text(_err(
-            f"Unknown indicator: {rest[0]}\nValid: " + ", ".join(sorted(_IND_TF_REGISTRY))
+            f"Unknown indicator: {rest[0]}\nValid: " + _IND_TF_SUMMARY
         ))
         return
     attr, kind = entry
@@ -1433,16 +1436,31 @@ async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             lines.append(f"{tf_label(tf)} —")
             continue
         snap = compute_all(bars, skip_current=False)  # current running candle
-        val = getattr(snap, attr, None)
-        if val is None:
-            lines.append(f"{tf_label(tf)} —")
-            continue
-        if kind == "price":
-            value = _fmt_ohlc(val, symbol, sinfo)
-        elif kind == "ratio":
-            value = f"{val:.2f}"
-        else:  # pct, idx, ratio100
-            value = f"{val:.1f}"
+        if kind == "bb_full":
+            u, m, lo = snap.bb_upper, snap.bb_middle, snap.bb_lower
+            if u is None or m is None or lo is None:
+                lines.append(f"{tf_label(tf)} —")
+                continue
+            pip = sinfo.point * 10 if sinfo and sinfo.point > 0 else 0.01
+            width_pips = (u - lo) / pip if pip > 0 else 0.0
+            value = (f"U {_fmt_ohlc(u, symbol, sinfo)}  M {_fmt_ohlc(m, symbol, sinfo)}  "
+                     f"L {_fmt_ohlc(lo, symbol, sinfo)}")
+            if snap.bb_percent_b is not None:
+                value += f"  %b {snap.bb_percent_b:.1f}"
+            value += f"  W {width_pips:.1f}p"
+            if snap.bb_width_pctile is not None:
+                value += f"  Wpct {snap.bb_width_pctile:.0f}"
+        else:
+            val = getattr(snap, attr, None)
+            if val is None:
+                lines.append(f"{tf_label(tf)} —")
+                continue
+            if kind == "price":
+                value = _fmt_ohlc(val, symbol, sinfo)
+            elif kind == "ratio":
+                value = f"{val:.2f}"
+            else:  # pct, idx, ratio100
+                value = f"{val:.1f}"
         lines.append(f"{tf_label(tf)} {value}")
 
     header = f"📊 {_display_symbol(symbol).upper()} · {ind_key.upper()} · current candle"
