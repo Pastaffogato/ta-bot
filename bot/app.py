@@ -152,7 +152,7 @@ def build_app() -> Application:
     from bot.telegram_app import (
         cmd_add, cmd_cancel, cmd_clear, cmd_data,
         cmd_del, cmd_entry, cmd_focus_pair, cmd_help,
-        cmd_indicator, cmd_level, cmd_list, cmd_mark, cmd_mark_del, cmd_mark_list,
+        cmd_indicator, cmd_indicator_tf, cmd_level, cmd_list, cmd_mark, cmd_mark_del, cmd_mark_list,
         cmd_modify, cmd_now, cmd_offset, cmd_price, cmd_signals, cmd_status, cmd_trend,
     )
 
@@ -181,6 +181,7 @@ def build_app() -> Application:
         ("entry", cmd_entry), ("e", cmd_entry),
         ("modify", cmd_modify), ("m", cmd_modify),
         ("indicator", cmd_indicator), ("ind", cmd_indicator),
+        ("indtf", cmd_indicator_tf), ("itf", cmd_indicator_tf),
         ("trend", cmd_trend), ("tr", cmd_trend),
         ("signals", cmd_signals),
     ]

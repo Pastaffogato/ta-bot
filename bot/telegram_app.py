@@ -1125,6 +1125,7 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "show_pattern", "show_ohlc", "show_range_body", "show_bid_ask",
         "show_marks", "show_indicators", "show_trend", "show_progression",
         "show_sma", "show_ema", "show_bb", "show_atr", "show_rsi", "show_adx",
+        "show_er", "show_chop",
     }
 
     if not args:
@@ -1336,6 +1337,116 @@ async def cmd_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     report = format_indicator_full(snap, symbol, sinfo)
 
     await update.message.reply_text(f"{header}\n\n{report}")
+
+
+# Registry for /indtf (multi-timeframe indicator snapshot).
+# alias -> (IndicatorSnapshot attr, kind) where kind drives formatting:
+#   price    -> _fmt_ohlc
+#   ratio    -> 2 decimals
+#   pct/idx/ratio100 -> 1 decimal
+_IND_TF_REGISTRY: dict[str, tuple[str, str]] = {
+    "sma50": ("sma50", "price"),
+    "ema20": ("ema20", "price"),
+    "bb": ("bb_percent_b", "pct"),
+    "bb_b": ("bb_percent_b", "pct"),
+    "bb_width": ("bb_width_pct", "pct"),
+    "bb_pctile": ("bb_width_pctile", "pct"),
+    "rsi": ("rsi", "idx"),
+    "adx": ("adx", "idx"),
+    "tratr": ("tr_ratio", "ratio"),
+    "tr_atr": ("tr_ratio", "ratio"),
+    "atr": ("tr_ratio", "ratio"),
+    "er": ("er14", "ratio100"),
+    "er14": ("er14", "ratio100"),
+    "chop": ("chop14", "idx"),
+    "chop14": ("chop14", "idx"),
+}
+
+_DEFAULT_IND_TFS = [1, 3, 5, 15, 30, 60]
+
+
+async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Multi-timeframe indicator snapshot. /indtf [SYMBOL] <indicator> [TF ...]"""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(_err(
+            "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
+            "Indicators: " + ", ".join(sorted(_IND_TF_REGISTRY)) + "\n"
+            "Example: /indtf XAUUSD rsi 5 15\n"
+            "Or set focus with /fp first, then /indtf rsi 15"
+        ))
+        return
+
+    # First arg may be a symbol; otherwise fall back to the focus pair.
+    rest = args
+    resolved = await mt5_data.resolve_symbol(args[0])
+    if resolved:
+        symbol = resolved
+        rest = args[1:]
+    elif focus := _get_focus(chat_id):
+        symbol = focus
+    else:
+        await update.message.reply_text(_err(
+            f"Symbol not found: {args[0]}\n"
+            "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
+            "Or set focus with /fp first"
+        ))
+        return
+
+    if not rest:
+        await update.message.reply_text(_err(
+            "Missing indicator.\nValid: " + ", ".join(sorted(_IND_TF_REGISTRY))
+        ))
+        return
+
+    ind_key = rest[0].lower()
+    entry = _IND_TF_REGISTRY.get(ind_key)
+    if entry is None:
+        await update.message.reply_text(_err(
+            f"Unknown indicator: {rest[0]}\nValid: " + ", ".join(sorted(_IND_TF_REGISTRY))
+        ))
+        return
+    attr, kind = entry
+
+    # Trailing args that parse as timeframes override the default TF list.
+    tfs = _DEFAULT_IND_TFS
+    tf_args = rest[1:]
+    if tf_args:
+        parsed = []
+        for a in tf_args:
+            tf_min = parse_tf(a)
+            if tf_min is None:
+                await update.message.reply_text(_err(f"Invalid timeframe: {a}"))
+                return
+            parsed.append(tf_min)
+        tfs = parsed
+
+    from bot.indicators import compute_all
+
+    sinfo = await mt5_data.symbol_info(symbol)
+    lines = []
+    for tf in tfs:
+        bars = await mt5_data.bars_n(symbol, tf, 500)
+        if not bars:
+            lines.append(f"{tf_label(tf)} —")
+            continue
+        snap = compute_all(bars, skip_current=False)  # current running candle
+        val = getattr(snap, attr, None)
+        if val is None:
+            lines.append(f"{tf_label(tf)} —")
+            continue
+        if kind == "price":
+            value = _fmt_ohlc(val, symbol, sinfo)
+        elif kind == "ratio":
+            value = f"{val:.2f}"
+        else:  # pct, idx, ratio100
+            value = f"{val:.1f}"
+        lines.append(f"{tf_label(tf)} {value}")
+
+    header = f"📊 {_display_symbol(symbol).upper()} · {ind_key.upper()} · current candle"
+    await update.message.reply_text(f"{header}\n" + "\n".join(lines))
 
 
 async def cmd_trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

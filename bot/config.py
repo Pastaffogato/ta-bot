@@ -45,7 +45,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
 
 # ---- defaults ----
-DEFAULT_OFFSET_S = 8          # seconds before candle close
+DEFAULT_OFFSET_S = 0          # seconds before candle close (0 = at close; offsets > 0 make the pattern provisional since the candle is still forming)
 DEFAULT_TIMEZONE = "Etc/GMT-8"  # UTC+8
 LATE_SEND_TOLERANCE_S = 3    # skip if we're this late
 TICK_FRESHNESS_S = 10         # max tick age before "stale"

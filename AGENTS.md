@@ -11,7 +11,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 
 **Stack:** Python 3.11+, `python-telegram-bot[job-queue]` v20.x, `MetaTrader5`, `numpy`, `pyyaml`, SQLite via stdlib. Windows-only (MT5 requires Windows).
 
-`bot/indicators.py` module adds BB(20,2) on close (population std), SMA50, EMA20, ATR(14) with trend (Wilder's), RSI(14) (Wilder's), ADX(14) (Wilder's `alpha=1/period`, matches MT5 ADXW) — all computed from OHLCV bar arrays via numpy. VWAP and Relative Volume were removed during alignment.
+`bot/indicators.py` module adds BB(20,2) on close (population std), SMA50, EMA20, ATR(14) (Wilder's), RSI(14) (Wilder's), ADX(14) (Wilder's `alpha=1/period`, matches MT5 ADXW), ER(14) Efficiency Ratio, CHOP(14) Choppiness — all computed from OHLCV bar arrays via numpy. VWAP and Relative Volume were removed during alignment.
 
 ## Architecture
 
@@ -67,7 +67,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 - `BASE_DIR` = project root, `DB_PATH` = `bot.db`, `PAIRS_PATH` = `pairs.yaml`.
 - `PAIRS`: `ideal_name → broker_symbol` (e.g. `xauusd → XAUUSD.pc`).
 - `PAIRS_REVERSE`: `broker_symbol → ideal_name` (all uppercase keys).
-- `DEFAULT_OFFSET_S = 8`, `DEFAULT_TIMEZONE = "Etc/GMT-8"`, `LATE_SEND_TOLERANCE_S = 3`, `PRICE_POLL_INTERVAL_S = 1.0`.
+- `DEFAULT_OFFSET_S = 0`, `DEFAULT_TIMEZONE = "Etc/GMT-8"`, `LATE_SEND_TOLERANCE_S = 3`, `PRICE_POLL_INTERVAL_S = 1.0`.
 - Logging: StreamHandler + FileHandler to `bot.log`. Silences httpx and telegram loggers.
 
 ### `bot/models.py` — Dataclasses
@@ -164,11 +164,11 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 ### `bot/indicators.py` — Indicator Computation
 - `compute_all(bars, skip_current=False)` → `IndicatorSnapshot` — all indicators from a list of Bar objects (newest first). Uses numpy for vectorized operations.
 - `skip_current` parameter: when `True`, drops `bars[0]` (the newest/incomplete bar) before computing. The scheduler passes `skip_current=new_bar_appeared` so indicators align with the OHLC candle shown.
-- Indicators: **BB(20,2) on close** (upper/middle/lower, width%, population std `ddof=0`), **SMA50**, **EMA20** (seeded with SMA of first 20 closes), **ATR(14)** (Wilder's smoothing, stores `atr`/`atr_prev`/`atr_prev2`), **RSI(14)** (Wilder's, stores `rsi`/`rsi_prev`/`rsi_prev2`), **ADX(14)** (Wilder's `alpha=1/period`, matches MT5 ADXW; stores `adx`/`di_plus`/`di_minus`). VWAP and Relative Volume were removed.
-- `IndicatorSnapshot` fields: `sma50`, `ema20`, `bb_upper`, `bb_middle`, `bb_lower`, `bb_width_pct`, `atr`, `atr_prev`, `atr_prev2`, `atr_pct`, `rsi`, `rsi_prev`, `rsi_prev2`, `adx`, `di_plus`, `di_minus`, `current_close`, `bar_count`.
-- `format_indicator_section(snap, symbol, sinfo, prefs=None)` → compact 5-line display for candle alerts. Respects granular prefs (`show_bb`, `show_sma`, `show_ema`, `show_atr`, `show_rsi`, `show_adx` — all default `"on"`).
-- `format_indicator_full(snap, symbol, sinfo)` → full report for `/ind` command.
-- 5-line layout: BB → SMA50+EMA20 → ATR → RSI → ADX. Empty lines skipped when granular pref is off.
+- Indicators: **BB(20,2) on close** (upper/middle/lower, population std `ddof=0`, plus `bb_percent_b` (%b, 0-100) and `bb_width_pctile` (width percentile vs last ≤100 windows); legacy `bb_width_pct` kept as a %b alias), **SMA50**, **EMA20** (seeded with SMA of first 20 closes), **ATR(14)** (Wilder's smoothing, stores `atr`/`atr_prev`/`atr_prev2`; alerts show `tr_ratio` = TR of the target candle ÷ ATR), **RSI(14)** (Wilder's, stores `rsi`/`rsi_prev`/`rsi_prev2`), **ADX(14)** (Wilder's `alpha=1/period`, matches MT5 ADXW; stores `adx`/`di_plus`/`di_minus`), **ER(14)** Efficiency Ratio (`er14`, 0-1), **CHOP(14)** Choppiness (`chop14`, 0-100, TradingView formula). VWAP and Relative Volume were removed.
+- `IndicatorSnapshot` fields: `sma50`, `ema20`, `bb_upper`, `bb_middle`, `bb_lower`, `bb_width_pct`, `bb_percent_b`, `bb_width_pctile`, `atr`, `atr_prev`, `atr_prev2`, `atr_pct`, `tr_ratio`, `rsi`, `rsi_prev`, `rsi_prev2`, `adx`, `di_plus`, `di_minus`, `er14`, `chop14`, `current_close`, `bar_count`.
+- `format_indicator_section(snap, symbol, sinfo, prefs=None)` → compact 5-line display for candle alerts. Respects granular prefs (`show_bb`, `show_sma`, `show_ema`, `show_atr`, `show_adx`, `show_rsi`, `show_er`, `show_chop` — all default `"on"`).
+- `format_indicator_full(snap, symbol, sinfo)` → full report for `/ind` command (keeps BB band prices; adds %b/Wpct, TR/ATR, ER, CHOP).
+- 5-line layout: BB → SMA50+EMA20 → TR/ATR+ADX → RSI → ER/CHOP. Empty lines/parts skipped when granular pref is off.
 - `INDICATOR_TARGETS` dict: maps indicator names to `(attribute, label)` pairs — `sma50`, `ema20`, `bb_upper`, `bb_lower`, `bb_middle`.
 - `resolve_indicator_target(snap, name)` → resolves a dynamic indicator target from a snapshot. Returns float or None. Reusable by price alerts, marks, and paper-trade TP/SL.
 - `indicator_display_label(name)` → human-readable label for an indicator target name.
@@ -181,7 +181,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 - `classify(bar, prev_bar)` → `Pattern(emoji, label, bias)`.
 - Detection order: Engulfing (bear/bull) → Hammer → Shooting Star → Doji → Bullish/Bearish.
 - Engulfing requires: body ≥ 5% of range, opposite direction, close crosses previous open.
-- Pattern is evaluated on the **incomplete** current bar — may shift before close.
+- Pattern is evaluated on the **incomplete** current bar — may shift before close. With `DEFAULT_OFFSET_S = 0` (the default) alerts fire at close and the pattern classifies the just-closed candle (final). Any offset > 0 makes it provisional: a forming candle can print BULL ENGULF then close red. Verified: a closed bearish candle (c < o) can never produce BULL ENGULF.
 
 ### `bot/app.py` — Application Builder
 - `build_app()` — creates PTB `Application`, registers all `CommandHandler`s (with short aliases: `/a`, `/d`, `/l`, `/p`, `/c`, `/s`, `/e`, `/m`, `/mk`, `/dt`, `/n`, `/lv`, `/o`, `/mkd`, `/mkl`).
@@ -191,7 +191,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 - Scheduler callbacks: `_send_candle`, `_send_price`, `_send_error`, `_send_paper_trade` — all call `_app_ref.bot.send_message()`.
 
 ### `bot/telegram_app.py` — Command Handlers
-- **Command handlers**: `cmd_focus_pair`, `cmd_help`, `cmd_add`, `cmd_del`, `cmd_list`, `cmd_offset`, `cmd_now`, `cmd_level`, `cmd_price`, `cmd_cancel`, `cmd_status`, `cmd_data`, `cmd_mark`, `cmd_entry`, `cmd_modify`, `cmd_clear`, `cmd_indicator`, `cmd_trend`, plus shorthand wrappers (`cmd_mark_del`, `cmd_mark_list`).
+- **Command handlers**: `cmd_focus_pair`, `cmd_help`, `cmd_add`, `cmd_del`, `cmd_list`, `cmd_offset`, `cmd_now`, `cmd_level`, `cmd_price`, `cmd_cancel`, `cmd_status`, `cmd_data`, `cmd_mark`, `cmd_entry`, `cmd_modify`, `cmd_clear`, `cmd_indicator`, `cmd_indicator_tf`, `cmd_trend`, plus shorthand wrappers (`cmd_mark_del`, `cmd_mark_list`).
 - **Focus pair**: `_focus_pairs: dict[int, str]` — per-chat in-memory dict, session-only, not persisted. Resolved via `_get_focus(chat_id)`.
 - **Multi-arg support**: `/add 5 15 30`, `/del 5 15 30`, `/price 2400 2450 2500`, `/mark 2400 2450 2500` — all work with focus pair.
 - **Indicator-based price alerts**: `/price sma50 above`, `/price bb_lower` — stores `indicator` field on PriceAlert, scheduler resolves dynamic target each cycle. Also supports expiry: `/price sma50 above 30m`.
@@ -246,7 +246,7 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 - **Paper trade `order_type` transitions** — limit/stop orders become "market" on activation. The scheduler checks this field to decide whether to skip SL/TP for pending orders.
 - **Offset=0 indicator alignment** — At offset=0, MT5 may not have rolled to a new bar yet when the alert fires. The scheduler detects this via `new_bar_appeared` and passes `skip_current=new_bar_appeared` to `compute_all`. If `skip_current` were always `True` (as it was before), indicators would show the candle *before* the just-closed one. `/now` and `/ind` use `skip_current=False` to show the current running candle.
 - **`show_indicators` default is `"on"`** — `format_candle_message` treats unset as `"on"` (line 133 in `formatting.py`). The `/data` command also displays `"on"` as default. Both must agree.
-- **5-line indicator format** — `format_indicator_section` outputs: BB → SMA50+EMA20 → ATR → RSI → ADX. BB bands separated by `-`, width+pct together (`27.9p-0.3%`). ATR and RSI values separated by `-` (no spaces). Granular prefs (`show_bb`, `show_sma`, etc.) drop only their line.
+- **5-line indicator format** — `format_indicator_section` outputs: BB → SMA50+EMA20 → TR/ATR+ADX → RSI → ER/CHOP. BB line: `BB %b 42  W 27.9p  Wpct 87` (%b, width in pips, width percentile vs last 100 candles — no band prices in alerts; bands only in `/ind`). TR/ATR line combines `TR/ATR 1.12` + `ADX 24` (ADX value only, no +DI/-DI). ER/CHOP line: `ER 45.2  CHOP 58.1`. Granular prefs (`show_bb`, `show_sma`, `show_atr`, `show_adx`, `show_er`, `show_chop`, etc.) drop only their line/part.
 
 ## Command → Handler Mapping
 
@@ -271,6 +271,7 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 | `/modify`, `/m` | `cmd_modify` | sl/tp/close for paper trades; supports indicator names for sl/tp |
 | `/clear` | `cmd_clear` | Remove all alerts + marks |
 | `/indicator`, `/ind` | `cmd_indicator` | On-demand indicator data (current running candle) |
+| `/indtf`, `/itf` | `cmd_indicator_tf` | One indicator across TFs (default M1/M3/M5/M15/M30/H1) |
 | `/trend`, `/tr` | `cmd_trend` | Trend classification with lookback + indicator context |
 
 ## Development Workflow

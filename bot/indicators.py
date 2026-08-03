@@ -3,7 +3,8 @@
 All functions operate on numpy arrays in chronological order (oldest first).
 Bars are passed newest-first and reversed internally.
 
-SMA50, EMA20 (on close), BB(20,2) on close, ATR(14), RSI(14), ADX(14) with +DI/-DI.
+SMA50, EMA20 (on close), BB(20,2) on close, ATR(14), RSI(14), ADX(14) with +DI/-DI,
+plus %b, BB width percentile, TR/ATR ratio, ER(14), and CHOP(14).
 """
 
 from dataclasses import dataclass, field
@@ -22,16 +23,21 @@ class IndicatorSnapshot:
     bb_middle: Optional[float] = None
     bb_lower: Optional[float] = None
     bb_width_pct: Optional[float] = None  # (upper - lower) / middle * 100
+    bb_percent_b: Optional[float] = None  # %b 0-100: (close - lower) / (upper - lower) * 100
+    bb_width_pctile: Optional[float] = None  # 0-100: rank of current BB(20,2) width among last ≤100 windows
     atr: Optional[float] = None  # ATR(14) — latest
     atr_prev: Optional[float] = None  # ATR(14) — 1 bar ago
     atr_prev2: Optional[float] = None  # ATR(14) — 2 bars ago
     atr_pct: Optional[float] = None  # ATR / close * 100
+    tr_ratio: Optional[float] = None  # TR(latest bar) / ATR(14)
     rsi: Optional[float] = None  # RSI(14) — latest
     rsi_prev: Optional[float] = None  # RSI(14) — 1 bar ago
     rsi_prev2: Optional[float] = None  # RSI(14) — 2 bars ago
     adx: Optional[float] = None  # ADX(14), 0-100
     di_plus: Optional[float] = None  # +DI(14)
     di_minus: Optional[float] = None  # -DI(14)
+    er14: Optional[float] = None  # Kaufman Efficiency Ratio(14), 0-1
+    chop14: Optional[float] = None  # Choppiness Index(14), 0-100
     current_close: Optional[float] = None
     bar_count: int = 0
 
@@ -84,6 +90,22 @@ def compute_all(bars: list, skip_current: bool = False) -> IndicatorSnapshot:
             snap.bb_width_pct = float(
                 (snap.current_close - snap.bb_lower) / bb_range * 100.0
             )
+            # %b (0-100): same value, exposed under its correct name.
+            snap.bb_percent_b = float(
+                (snap.current_close - snap.bb_lower) / bb_range * 100.0
+            )
+
+    # ── BB width percentile: current band width vs last up-to-100 BB(20,2) windows ──
+    if n >= 21:
+        n_windows = min(100, n - 20)
+        widths = np.array(
+            [
+                4.0 * float(np.std(closes[i - 19 : i + 1], ddof=0))
+                for i in range(n - n_windows, n)
+            ],
+            dtype=np.float64,
+        )
+        snap.bb_width_pctile = float(np.mean(widths <= widths[-1]) * 100.0)
 
     # ── ATR(14) with rolling last 3 ──
     if n >= 15:
@@ -96,6 +118,11 @@ def compute_all(bars: list, skip_current: bool = False) -> IndicatorSnapshot:
             snap.atr_prev2 = atr_vals[-3]
         if snap.atr is not None and snap.current_close and snap.current_close > 0:
             snap.atr_pct = snap.atr / snap.current_close * 100
+
+        # TR/ATR ratio: latest bar's true range (on the truncated array) vs ATR
+        if snap.atr is not None and snap.atr > 0:
+            tr_all = _true_range(highs, lows, closes)
+            snap.tr_ratio = float(tr_all[-1]) / snap.atr
 
     # ── RSI(14) with rolling last 3 ──
     if n >= 15:
@@ -113,6 +140,23 @@ def compute_all(bars: list, skip_current: bool = False) -> IndicatorSnapshot:
         snap.adx = adx_val
         snap.di_plus = di_p
         snap.di_minus = di_m
+
+    # ── Kaufman Efficiency Ratio(14), 0-1 ──
+    if n >= 15:
+        num = abs(closes[-1] - closes[-15])
+        denom = float(np.sum(np.abs(np.diff(closes[-15:]))))
+        if denom > 0:
+            snap.er14 = float(min(num / denom, 1.0))
+        else:
+            snap.er14 = 0.0  # perfectly flat market
+
+    # ── Choppiness Index(14), 0-100 (high = choppy) ──
+    if n >= 14:
+        tr_all = _true_range(highs, lows, closes)
+        sum_tr = float(np.sum(tr_all[-14:]))
+        span = float(np.max(highs[-14:]) - np.min(lows[-14:]))
+        if span > 0 and sum_tr > 0:
+            snap.chop14 = float(100.0 * np.log10(sum_tr / span) / np.log10(14.0))
 
     return snap
 
@@ -460,15 +504,15 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
     """Build a compact indicator display section for candle alerts.
 
     Five lines (each respecting granular prefs; empty lines are skipped):
-    Line 1: BB(20,2) high / mid / low + width in pips
+    Line 1: BB %b + band width in pips + width percentile
     Line 2: SMA50 + EMA20
-    Line 3: ATR(14) last 3 values ('-' separated) + compressing/expanding note
-    Line 4: RSI(14) last 3 values ('-' separated) + OB/OS zone
-    Line 5: ADX(14) with +DI/-DI + strength
+    Line 3: TR/ATR ratio + ADX
+    Line 4: RSI(14) + OB/OS zone
+    Line 5: ER(14) + CHOP(14)
 
-    Granular prefs: show_sma, show_ema, show_bb, show_atr, show_rsi, show_adx.
-    When a granular pref is "off", that indicator is hidden (along with its line if empty).
-    show_indicators=off skips everything.
+    Granular prefs: show_sma, show_ema, show_bb, show_atr, show_adx, show_rsi,
+    show_er, show_chop. When a granular pref is "off", that indicator is hidden
+    (along with its line if empty). show_indicators=off skips everything.
     """
     from bot.formatting import fmt_ohlc
 
@@ -481,14 +525,14 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
     def _on(key):
         return prefs.get(key, "on") != "off"
 
-    # Line 1: BB(20,2)
+    # Line 1: BB — %b position + band width in pips + width percentile
     if _on("show_bb") and snap.bb_upper is not None:
-        bb_high = fmt_ohlc(snap.bb_upper, symbol, sinfo)
-        bb_mid = fmt_ohlc(snap.bb_middle, symbol, sinfo)
-        bb_low = fmt_ohlc(snap.bb_lower, symbol, sinfo)
+        bb_pct = "—" if snap.bb_percent_b is None else f"{snap.bb_percent_b:.0f}"
         bb_width_pips = (snap.bb_upper - snap.bb_lower) / pip_size if pip_size > 0 else 0
-        bb_pct = snap.bb_width_pct if snap.bb_width_pct else 0
-        lines.append(f"BB {bb_high}-{bb_mid}-{bb_low} {bb_width_pips:.1f}p-{bb_pct:.1f}%")
+        bb_line = f"BB %b {bb_pct}  W {bb_width_pips:.1f}p"
+        if snap.bb_width_pctile is not None:
+            bb_line += f"  Wpct {snap.bb_width_pctile:.0f}"
+        lines.append(bb_line)
 
     # Line 2: SMA50 + EMA20
     parts2 = []
@@ -499,24 +543,14 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
     if parts2:
         lines.append("  ".join(parts2))
 
-    # Line 3: ATR(14) — last 3 values separated by '-' + compression note
-    if _on("show_atr") and snap.atr is not None:
-        atr_vals = [snap.atr]
-        if snap.atr_prev is not None:
-            atr_vals.append(snap.atr_prev)
-        if snap.atr_prev2 is not None:
-            atr_vals.append(snap.atr_prev2)
-        atr_str = "-".join(fmt_ohlc(v, symbol, sinfo) if sinfo else f"{v:.5f}" for v in atr_vals)
-        # compressing / expanding: compare latest ATR vs previous ATR
-        note = ""
-        if snap.atr_prev is not None:
-            if snap.atr > snap.atr_prev:
-                note = " expanding"
-            elif snap.atr < snap.atr_prev:
-                note = " compressing"
-            else:
-                note = " flat"
-        lines.append(f"ATR {atr_str}{note}")
+    # Line 3: TR/ATR ratio + ADX (independent granular prefs)
+    parts3 = []
+    if _on("show_atr") and snap.tr_ratio is not None:
+        parts3.append(f"TR/ATR {snap.tr_ratio:.2f}")
+    if _on("show_adx") and snap.adx is not None:
+        parts3.append(f"ADX {snap.adx:.0f}")
+    if parts3:
+        lines.append("  ".join(parts3))
 
     # Line 4: RSI(14) — last 3 values separated by '-' + OB/OS zone
     if _on("show_rsi") and snap.rsi is not None:
@@ -533,17 +567,14 @@ def format_indicator_section(snap: IndicatorSnapshot, symbol: str, sinfo, prefs:
             zone = " OS"
         lines.append(f"RSI {rsi_str}{zone}")
 
-    # Line 5: ADX(14) with +DI/-DI + strength
-    if _on("show_adx") and snap.adx is not None:
-        strength = ""
-        if snap.adx > 50:
-            strength = " strong"
-        elif snap.adx > 25:
-            strength = " present"
-        di_str = ""
-        if snap.di_plus is not None and snap.di_minus is not None:
-            di_str = f" +DI {snap.di_plus:.0f} -DI {snap.di_minus:.0f}"
-        lines.append(f"ADX {snap.adx:.0f}{di_str}{strength}")
+    # Line 5: ER(14) + CHOP(14) (independent granular prefs)
+    parts5 = []
+    if _on("show_er") and snap.er14 is not None:
+        parts5.append(f"ER {snap.er14 * 100:.1f}")
+    if _on("show_chop") and snap.chop14 is not None:
+        parts5.append(f"CHOP {snap.chop14:.1f}")
+    if parts5:
+        lines.append("  ".join(parts5))
 
     return "\n".join(lines)
 
@@ -571,7 +602,14 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
             f"{fmt_ohlc(snap.bb_middle, symbol, sinfo)} — "
             f"{fmt_ohlc(snap.bb_lower, symbol, sinfo)}"
         )
-        parts.append(f"  Width: {bb_width_pips:.1f}p ({snap.bb_width_pct:.1f}%)" if snap.bb_width_pct else f"  Width: {bb_width_pips:.1f}p")
+        width_line = f"  Width: {bb_width_pips:.1f}p"
+        if snap.bb_width_pct:
+            width_line += f" ({snap.bb_width_pct:.1f}%)"
+        if snap.bb_percent_b is not None:
+            width_line += f"  %b {snap.bb_percent_b:.1f}"
+        if snap.bb_width_pctile is not None:
+            width_line += f"  Wpct {snap.bb_width_pctile:.0f}"
+        parts.append(width_line)
 
     if snap.atr is not None:
         atr_now = fmt_ohlc(snap.atr, symbol, sinfo)
@@ -581,7 +619,8 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
             prev_str += f" - {fmt_ohlc(snap.atr_prev, symbol, sinfo)}"
         if snap.atr_prev2 is not None:
             prev_str += f" - {fmt_ohlc(snap.atr_prev2, symbol, sinfo)}"
-        parts.append(f"ATR(14): {atr_now}{prev_str}{pct_str}")
+        ratio_str = f"  TR/ATR {snap.tr_ratio:.2f}" if snap.tr_ratio is not None else ""
+        parts.append(f"ATR(14): {atr_now}{prev_str}{pct_str}{ratio_str}")
 
     if snap.rsi is not None:
         rsi_str = f"{snap.rsi:.1f}"
@@ -602,6 +641,11 @@ def format_indicator_full(snap: IndicatorSnapshot, symbol: str, sinfo) -> str:
         if snap.di_plus is not None and snap.di_minus is not None:
             di_str = f" | +DI: {snap.di_plus:.1f} | -DI: {snap.di_minus:.1f}"
         parts.append(f"ADX(14): {snap.adx:.1f}{di_str} — {strength}")
+
+    if snap.er14 is not None:
+        parts.append(f"ER(14): {snap.er14 * 100:.1f}")
+    if snap.chop14 is not None:
+        parts.append(f"CHOP(14): {snap.chop14:.1f}")
 
     if snap.current_close is not None:
         parts.append(f"Close: {fmt_ohlc(snap.current_close, symbol, sinfo)}")
@@ -730,14 +774,9 @@ def format_trend_section(bars: list, symbol: str, sinfo, lookback: int = 20) -> 
 
     snap = result.snap
     if snap:
-        # ATR compression note
-        if snap.atr is not None and snap.atr_prev is not None:
-            if snap.atr > snap.atr_prev:
-                parts.append("ATR expanding")
-            elif snap.atr < snap.atr_prev:
-                parts.append("ATR compressing")
-            else:
-                parts.append("ATR flat")
+        # TR/ATR ratio (volatility state)
+        if snap.tr_ratio is not None:
+            parts.append(f"TR/ATR {snap.tr_ratio:.2f}")
         # RSI value
         if snap.rsi is not None:
             zone = ""

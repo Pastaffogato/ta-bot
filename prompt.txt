@@ -1,0 +1,14 @@
+I want a tech lead to implement a feature modification. Plan accordingly for delegation to agents for specific task with just enough context for efficient token usage.
+Feature change:
+specifically for candlebot indicator and its formatting. I want to make it leaner, so its easier to interpret and more usable (keep in context its modular nature, feel free to re-factor it to make it more efficient or better (with consideration of how it fits in other feature).
+Change:
+- BB: no need to show the band for most candle alert. Just show BB %b, Width, and at what percentile is the current width compared against last 100 candle. In .ind status, its alright to show the band value like usual.
+- ATR, I only need TR/ATR ratio, no need for anything else
+- ADX, I only need the ADX value. Feel free to combine this in the same line as TR/ATR ratio.
+- I want an ER(14), Efficiency Ratio, and CHOP(14) Chop ratio. just need the current value for the candle its targetted.
+- SMA50, no change
+Small Command Rework:
+- Make another variation of .ind command, where I can view the variation of specific indicator for multiple timeframe (m1,m3,m5,m15,m30,h1) for a given pair.
+In doing all this, consider the nature of the code base, e.g. how it formats the message modularly, how it have variation for current candle and previous candle, etc.
+Small Bug Fix: Double Check for Candle Pattern Recognition, sometimes I receive a Bullish Engulf Recognition, when the candle is actually going negative. Not sure how its possible.
+Plan accordingly and logically, to make execution smooth and accurate, if possible delegate to sub-agents in a way that is token efficient.

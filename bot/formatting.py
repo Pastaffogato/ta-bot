@@ -82,11 +82,14 @@ def format_candle_message(
     bid_str = fmt_ohlc(tick.bid, symbol, sinfo) if tick else "—"
     emoji = pat.emoji if pat else "⏳"
     pip_change = ""
-    if bar and tick and sinfo and prev_bar:
+    if bar and prev_bar and sinfo:
         point_size = sinfo.point
         if point_size > 0:
             pip_size = point_size * 10
-            change_pips = (tick.bid - prev_bar.close) / pip_size
+            # Anchor to the closed candle (bar.close), NOT the live bid: the bid can
+            # reverse in the seconds after close (wake latency), producing a sign that
+            # contradicts the OHLC/pattern. bar.close keeps header consistent with them.
+            change_pips = (bar.close - prev_bar.close) / pip_size
             sign = "+" if change_pips >= 0 else ""
             pip_change = f" {sign}{change_pips:.1f}p"
     lines = [f"{emoji} {disp.upper()} {tf_label(tf_min)} {bid_str}{pip_change}"]
