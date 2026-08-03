@@ -1579,26 +1579,3 @@ async def cmd_mark_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Shorthand: /mkl [symbol] — list marks."""
     context.args = (["list"] + (context.args or []))
     await cmd_mark(update, context)
-
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove all alerts and marks for this chat."""
-    chat_id = update.effective_chat.id
-    db.ensure_user(chat_id)
-
-    n_candle = db.delete_all_candle_alerts(chat_id)
-    n_price = db.delete_all_price_alerts(chat_id)
-    n_mark = db.delete_all_marks(chat_id)
-
-    if n_candle > 0 or n_price > 0:
-        scheduler.subscriptions_changed.set()
-
-    total = n_candle + n_price + n_mark
-    if total > 0:
-        parts = []
-        if n_candle: parts.append(f"{n_candle} candle alerts")
-        if n_price: parts.append(f"{n_price} price alerts")
-        if n_mark: parts.append(f"{n_mark} marks")
-        await update.message.reply_text(f"🧹 Cleared {', '.join(parts)}")
-    else:
-        await update.message.reply_text("Nothing to clear")
