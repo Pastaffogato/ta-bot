@@ -124,6 +124,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/price XAUUSD above 2400 — directional\n"
         "/price sma50 h1 above — indicator crossing (TF required)\n"
         "/price bb_lower h4 — indicator, either direction\n"
+        "/price bbl 3 5 — indicator on multiple TFs (bbu/bbm/bbl shorthand)\n"
         "/cancel p7 — remove price alert\n"
         "/cancel — cancel all price alerts\n\n"
         "<b>Marks:</b>\n"
@@ -513,11 +514,12 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  /price close 2400 (cross and close)\n"
             "  /price 2400 30m (expires in 30 minutes)\n"
             "  /price sma50 h1 above (indicator crossing — TF required)\n"
-            "  /price bb_lower h4 (indicator, either direction)"
+            "  /price bb_lower h4 (indicator, either direction)\n"
+            "  /price bbl 3 5 (indicator, multiple TFs; bbu/bbm/bbl shorthand)"
         ))
         return
 
-    from bot.indicators import INDICATOR_TARGETS, indicator_display_label, resolve_indicator_target, compute_all
+    from bot.indicators import INDICATOR_TARGETS, canonical_indicator_name, indicator_display_label, resolve_indicator_target, compute_all
 
     focus = _get_focus(chat_id)
     resolved = None
@@ -560,82 +562,106 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # ── Indicator-based price alert ──
-    # Syntax: /price [SYMBOL] <INDICATOR> <TF> [above|below] [30m|2h]
-    # The indicator timeframe is REQUIRED and is independent of any candle-alert TF.
+    # Syntax: /price [SYMBOL] <INDICATOR> <TF> [TF...] [above|below] [30m|2h]
+    # The indicator timeframe(s) are REQUIRED and independent of any candle-alert TF.
+    # Multiple TFs create one alert per timeframe (e.g. /price bbl 3 5).
     if price_args[0].lower() in INDICATOR_TARGETS:
-        ind_name = price_args[0].lower()
-
-        # TF is mandatory and must come right after the indicator name.
-        if len(price_args) < 2:
-            await update.message.reply_text(_err(
-                f"Indicator alert needs a timeframe.\n"
-                f"Usage: /price {_display_symbol(resolved).upper() if resolved else '<symbol>'} {ind_name} <TF> [above|below] [30m|2h]\n"
-                f"Example: /price {ind_name} h1 above"
-            ))
-            return
-        ind_tf = parse_tf(price_args[1])
-        if ind_tf is None:
-            await update.message.reply_text(_err(
-                f"Invalid indicator timeframe: {price_args[1]}\n"
-                f"Use one of: m1, m5, m15, h1, h4, d1, ..."
-            ))
-            return
+        ind_name = canonical_indicator_name(price_args[0])
 
         direction = None
         expiry_s = None
         expiry_label = None
-        for a in price_args[2:]:
-            if a.lower() in ("above", "below"):
-                direction = a.lower()
-            else:
-                exp = _parse_expiry(a)
-                if exp is not None:
-                    expiry_s, expiry_label = exp
+        tf_list: list[int] = []
+        for a in price_args[1:]:
+            low = a.lower()
+            if low in ("above", "below"):
+                direction = low
+                continue
+            exp = _parse_expiry(a)
+            if exp is not None:
+                expiry_s, expiry_label = exp
+                continue
+            tf = parse_tf(a)
+            if tf is not None:
+                if tf not in tf_list:
+                    tf_list.append(tf)
+                continue
+            await update.message.reply_text(_err(
+                f"Invalid argument: {a}\n"
+                f"Usage: /price [SYMBOL] <indicator> <TF> [TF...] [above|below] [30m|2h]\n"
+                f"Example: /price {ind_name} 3 5 above"
+            ))
+            return
 
-        # Compute the current indicator value (on the requested TF) to show the user.
-        # skip_current=True → use the last completed bar of that TF (stable).
+        if not tf_list:
+            await update.message.reply_text(_err(
+                f"Indicator alert needs at least one timeframe.\n"
+                f"Usage: /price {_display_symbol(resolved).upper() if resolved else '<symbol>'} {ind_name} <TF> [TF...] [above|below] [30m|2h]\n"
+                f"Example: /price {ind_name} h1 above  or  /price {ind_name} 3 5"
+            ))
+            return
+
         tick = await mt5_data.tick(resolved)
         if tick is None:
             await update.message.reply_text(_err(f"No tick data for {_display_symbol(resolved)}"))
             return
 
-        try:
-            bars = await mt5_data.bars_n(resolved, ind_tf, 500)
-            snap = compute_all(bars, skip_current=True) if bars else None
-        except Exception:
-            snap = None
-
-        current_val = resolve_indicator_target(snap, ind_name) if snap else None
-        if current_val is None:
-            await update.message.reply_text(_err(f"Indicator {ind_name} not available yet on {tf_label(ind_tf)} (need more bars)"))
-            return
-
         from datetime import timedelta
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
 
-        # Store with target=current_val (the resolved indicator value) and the indicator TF.
-        alert = db.add_price_alert(
-            chat_id, resolved, current_val, direction,
-            alert_type="crossing", expires_at=expires_at,
-            indicator=ind_name, indicator_timeframe_min=ind_tf,
-        )
-        # Set initial side based on the current indicator value vs the live price.
-        current_side = "above" if tick.bid > current_val else "below"
-        db.update_price_alert(alert.id, last_side=current_side)
-        alert.last_side = current_side
+        # Compute the current indicator value per TF (skip_current=True → last completed
+        # bar of that TF, stable) and create one alert per timeframe.
+        created = []
+        skipped = []
+        for ind_tf in tf_list:
+            try:
+                bars = await mt5_data.bars_n(resolved, ind_tf, 500)
+                snap = compute_all(bars, skip_current=True) if bars else None
+            except Exception:
+                snap = None
+
+            current_val = resolve_indicator_target(snap, ind_name) if snap else None
+            if current_val is None:
+                skipped.append(ind_tf)
+                continue
+
+            # Store with target=current_val (the resolved indicator value) and the indicator TF.
+            alert = db.add_price_alert(
+                chat_id, resolved, current_val, direction,
+                alert_type="crossing", expires_at=expires_at,
+                indicator=ind_name, indicator_timeframe_min=ind_tf,
+            )
+            # Set initial side based on the current indicator value vs the live price.
+            current_side = "above" if tick.bid > current_val else "below"
+            db.update_price_alert(alert.id, last_side=current_side)
+            alert.last_side = current_side
+            created.append((alert, ind_tf, current_val))
+
+        if not created:
+            tfs_str = ", ".join(tf_label(t) for t in tf_list)
+            await update.message.reply_text(_err(
+                f"Indicator {ind_name} not available yet on {tfs_str} (need more bars)"
+            ))
+            return
 
         display = _display_symbol(resolved)
         label = indicator_display_label(ind_name)
         dir_str = f" {direction}" if direction else ""
         exp_str = f" {_fmt_expiry(expires_at)}" if expires_at else ""
-        await update.message.reply_text(
-            f"✅ Indicator alert p{alert.user_seq}{exp_str}\n"
-            f"{display.upper()} cross{dir_str} {label} @ {tf_label(ind_tf)}\n"
-            f"Current {label} ({tf_label(ind_tf)}): {_fmt_ohlc(current_val, resolved, None)}\n"
-            f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}\n"
-            f"/cancel p{alert.user_seq} to remove",
-            parse_mode=ParseMode.HTML,
-        )
+        ids = ", ".join(f"p{a.user_seq}" for a, _tf, _v in created)
+
+        lines = [f"✅ Indicator alert{'s' if len(created) > 1 else ''} {ids}{exp_str}"]
+        for _a, ind_tf, current_val in created:
+            lines.append(
+                f"{display.upper()} cross{dir_str} {label} @ {tf_label(ind_tf)}"
+                f" → {_fmt_ohlc(current_val, resolved, None)}"
+            )
+        if skipped:
+            lines.append(f"Skipped (no data yet): {', '.join(tf_label(t) for t in skipped)}")
+        lines.append(f"Current bid: {_fmt_ohlc(tick.bid, resolved, None)}")
+        lines.append("/cancel " + " or /cancel ".join(f"p{a.user_seq}" for a, _tf, _v in created) + " to remove")
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
     # Get tick data

@@ -658,7 +658,23 @@ INDICATOR_TARGETS: dict[str, tuple[str, str]] = {
     "bb_upper": ("bb_upper", "BB Upper"),
     "bb_lower": ("bb_lower", "BB Lower"),
     "bb_middle": ("bb_middle", "BB Middle"),
+    # Shorthand aliases → same targets (bbu/bbm/bbl)
+    "bbu": ("bb_upper", "BB Upper"),
+    "bbm": ("bb_middle", "BB Middle"),
+    "bbl": ("bb_lower", "BB Lower"),
 }
+
+# Shorthand aliases → canonical names (for clean DB storage)
+_INDICATOR_ALIASES: dict[str, str] = {
+    "bbu": "bb_upper",
+    "bbm": "bb_middle",
+    "bbl": "bb_lower",
+}
+
+
+def canonical_indicator_name(name: str) -> str:
+    """Map a shorthand alias to its canonical indicator name (identity otherwise)."""
+    return _INDICATOR_ALIASES.get(name.lower(), name.lower())
 
 
 def resolve_indicator_target(snap: "IndicatorSnapshot", name: str) -> Optional[float]:
