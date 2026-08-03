@@ -1382,20 +1382,31 @@ async def cmd_indicator_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ))
         return
 
-    # First arg may be a symbol; otherwise fall back to the focus pair.
+    # First arg may be a symbol — but ONLY if it's not a known indicator name.
+    # resolve_symbol() can substring-match real symbols that collide with
+    # indicator names (e.g. "bb" -> symbol "BB"), which would bypass the focus
+    # pair. Indicator interpretation wins for /indtf.
     rest = args
-    resolved = await mt5_data.resolve_symbol(args[0])
+    resolved = None
+    if args[0].lower() not in _IND_TF_REGISTRY:
+        resolved = await mt5_data.resolve_symbol(args[0])
     if resolved:
         symbol = resolved
         rest = args[1:]
     elif focus := _get_focus(chat_id):
         symbol = focus
     else:
-        await update.message.reply_text(_err(
-            f"Symbol not found: {args[0]}\n"
-            "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
-            "Or set focus with /fp first"
-        ))
+        if args[0].lower() in _IND_TF_REGISTRY:
+            await update.message.reply_text(_err(
+                f"No focus pair set.\nUsage: /indtf [SYMBOL] {args[0].lower()} [TF ...]\n"
+                f"Or set focus with /fp first, then /indtf {args[0].lower()}"
+            ))
+        else:
+            await update.message.reply_text(_err(
+                f"Symbol not found: {args[0]}\n"
+                "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
+                "Or set focus with /fp first"
+            ))
         return
 
     if not rest:
