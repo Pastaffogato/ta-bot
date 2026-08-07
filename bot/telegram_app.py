@@ -5,6 +5,7 @@ bot.formatting and bot.parsing respectively.  App wiring is in bot.app.
 """
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -132,7 +133,7 @@ _HELP_CHEAT_SHEET = (
     "/modify (m) t1 sl 2390 · /modify t1 tp 2420 · /modify t1 close\n\n"
     "<b>Other:</b>\n"
     "/signals (sig) [on|off] · /clear (clr) · /status (s) · /help (h)\n"
-    "/help <topic> — detailed help for one command, e.g. /help p\n\n"
+    "/help &lt;topic&gt; — detailed help for one command, e.g. /help p\n\n"
     "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
     "<b>Expiry suffixes:</b> 30m, 2h, 45s\n"
     "<b>Prefixless:</b> \"p bbm 1 3 5\" = /p bbm 1 3 5 · dot form: \".add 5\"\n"
@@ -235,7 +236,7 @@ _HELP_SECTIONS: dict[str, str] = {
     "indtf": (
         "<b>/indtf — multi-timeframe indicator</b>\n"
         "One indicator across M1/M3/M5/M15/M30/H1, or the TFs you list.\n\n"
-        "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
+        "Usage: /indtf [SYMBOL] &lt;indicator&gt; [TF ...]\n"
         "Indicators: bb (bands+%b+W+Wpct), sma50, ema20, rsi, adx,\n"
         "tratr (TR/ATR), er, chop\n"
         "Example: /indtf XAUUSD rsi 5 15\n"
@@ -253,7 +254,7 @@ _HELP_SECTIONS: dict[str, str] = {
         "<b>/price — price alerts</b>\n"
         "Crossing and close alerts, static price or indicator-based.\n\n"
         "Usage:\n"
-        "  /price [SYMBOL] <price> [more prices] [+50] [-30] [30m|2h|45s] [close]\n"
+        "  /price [SYMBOL] &lt;price&gt; [more prices] [+50] [-30] [30m|2h|45s] [close]\n"
         "  /price 2400 2450 — multiple crossing alerts\n"
         "  /price +50 -30 — relative pips from current price\n"
         "  /price close 2400 2450 — close range (smart-sorted)\n"
@@ -276,7 +277,7 @@ _HELP_SECTIONS: dict[str, str] = {
         "<b>/mark — price marks</b>\n"
         "Mark price levels that appear in candle alerts.\n\n"
         "Usage:\n"
-        "  /mark [SYMBOL] <price> [price ...] [30m|2h|45s]\n"
+        "  /mark [SYMBOL] &lt;price&gt; [price ...] [30m|2h|45s]\n"
         "  /mark del — delete all marks\n"
         "  /mark del 1 3 M5 — delete specific marks (M-prefix or bare)\n"
         "  /mark list [SYMBOL] — list marks\n\n"
@@ -309,7 +310,7 @@ _HELP_SECTIONS: dict[str, str] = {
     "data": (
         "<b>/data — alert sections</b>\n"
         "Toggle which sections appear in candle alerts.\n\n"
-        "Usage: /data on|off <section> [section ...]\n"
+        "Usage: /data on|off &lt;section&gt; [section ...]\n"
         "  /data off ind — hide indicators\n"
         "  /data off ba range — hide bid/ask + range body\n"
         "  /data off all — hide everything\n\n"
@@ -338,7 +339,7 @@ _HELP_SECTIONS: dict[str, str] = {
     ),
     "help": (
         "<b>/help — help</b>\n"
-        "Bare /help shows the cheat sheet; /help <topic> shows one command.\n\n"
+        "Bare /help shows the cheat sheet; /help &lt;topic&gt; shows one command.\n\n"
         "Topics: fp, add, del, list, offset, now, level, ind, indtf, trend,\n"
         "price, cancel, mark, entry, modify, data, signals, clear, status\n"
         "(shorthands work too, e.g. /help p).\n"
@@ -356,7 +357,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(_HELP_SECTIONS[canonical], parse_mode=ParseMode.HTML)
             return
         await update.message.reply_text(
-            f"❌ Unknown topic: {topic}\n\n" + _HELP_CHEAT_SHEET,
+            f"❌ Unknown topic: {html.escape(topic)}\n\n" + _HELP_CHEAT_SHEET,
             parse_mode=ParseMode.HTML,
         )
         return
