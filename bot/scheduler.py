@@ -273,8 +273,9 @@ async def _process_price_alerts(
 
         # For indicator-based alerts, compute a snapshot per (symbol, indicator_tf).
         # The indicator timeframe is stored on each alert and is independent of any
-        # candle-alert TF. We use skip_current=True so the target reflects the last
-        # completed bar of that timeframe (stable, not self-referential with the tick).
+        # candle-alert TF. We use skip_current=False so the target reflects the
+        # current RUNNING indicator level of that timeframe (matches /now and /ind),
+        # not the previous completed candle's value.
         ind_snaps: dict[tuple[str, int], "indicators.IndicatorSnapshot"] = {}
         indicator_alerts = [a for a in alerts if a.symbol == symbol and a.indicator]
         seen_tfs = {a.indicator_timeframe_min for a in indicator_alerts if a.indicator_timeframe_min}
@@ -282,7 +283,7 @@ async def _process_price_alerts(
             try:
                 bars = await mt5_data.bars_n(symbol, ind_tf, 500)
                 if bars:
-                    ind_snaps[(symbol, ind_tf)] = indicators.compute_all(bars, skip_current=True)
+                    ind_snaps[(symbol, ind_tf)] = indicators.compute_all(bars, skip_current=False)
             except Exception:
                 logger.debug("Indicator snapshot failed for %s @ %s", symbol, tf_label(ind_tf))
 

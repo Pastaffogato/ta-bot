@@ -609,8 +609,9 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from datetime import timedelta
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expiry_s)).isoformat() if expiry_s else None
 
-        # Compute the current indicator value per TF (skip_current=True → last completed
-        # bar of that TF, stable) and create one alert per timeframe.
+        # Compute the current indicator value per TF (skip_current=False → current
+        # running indicator level of that TF, matching /now and /ind) and create one
+        # alert per timeframe.
         created = []
         skipped = []
         for ind_tf in tf_list:
