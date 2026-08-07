@@ -83,8 +83,9 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 - Key functions (all synchronous):
   - `ensure_user(chat_id)` — upsert
   - `get_user(chat_id)` / `update_user(chat_id, **kwargs)`
-  - `add_candle_alert(chat_id, symbol, timeframe_min, offset_s)` — dedupes by (chat_id, symbol, timeframe_min)
+  - `add_candle_alert(chat_id, symbol, timeframe_min, offset_s)` — dedupes by (chat_id, symbol, timeframe_min); auto-assigns `user_seq` (lowest available, reuse gaps)
   - `get_candle_alerts()` — all enabled alerts
+  - `get_candle_alert_by_user_seq(chat_id, user_seq)` — lookup by per-user ID (cN)
   - `add_price_alert(chat_id, ...)` — auto-assigns `user_seq` (lowest available, reuse gaps)
   - `get_price_alerts(chat_id=None)` — None = all enabled
   - `get_price_alert_by_user_seq(chat_id, user_seq)` — lookup by per-user ID
@@ -97,7 +98,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
   - `get_user_prefs(chat_id)` / `set_user_pref(chat_id, key, value)` — user_prefs table
   - `was_delivered(chat_id, alert_key, candle_open_utc)` — dedup delivery
   - `record_delivery(chat_id, alert_key, candle_open_utc)` — mark sent
-- **user_seq logic**: per-user sequence numbers (1, 2, 3…) for price alerts, marks, paper trades. Reuses gaps (lowest available). Allows users to reference by `p1`, `t1`, `M1`.
+- **user_seq logic**: per-user sequence numbers (1, 2, 3…) for candle alerts, price alerts, marks, paper trades. Reuses gaps (lowest available). Allows users to reference by `c1`, `p1`, `t1`, `M1`.
 
 ### `bot/timeframes.py` — Timeframe Parsing
 - `parse_tf(raw)` → `int` (minutes) or `None`.
@@ -203,7 +204,7 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 
 ```sql
 users (chat_id PK, timezone, default_offset_s, created_at)
-candle_alerts (id PK, chat_id FK→users, symbol, timeframe_min, offset_s, enabled)
+candle_alerts (id PK, chat_id FK→users, user_seq, symbol, timeframe_min, offset_s, enabled)
 price_alerts (id PK, chat_id FK→users, user_seq, symbol, direction, target, target_upper, alert_type, price_source, repeat, enabled, last_side, expires_at, indicator, created_at)
 deliveries (chat_id, alert_key, candle_open_utc — composite PK)
 user_prefs (chat_id, key — composite PK, value)

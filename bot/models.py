@@ -15,6 +15,7 @@ class User:
 class CandleAlert:
     id: int = 0
     chat_id: int = 0
+    user_seq: int = 0  # per-user sequence number (1, 2, 3…), reuses gaps
     symbol: Optional[str] = None
     timeframe_min: int = 0
     offset_s: Optional[int] = None

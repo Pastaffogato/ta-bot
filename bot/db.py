@@ -44,6 +44,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS candle_alerts (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id       INTEGER NOT NULL REFERENCES users(chat_id),
+            user_seq      INTEGER NOT NULL DEFAULT 0,
             symbol        TEXT,
             timeframe_min INTEGER NOT NULL,
             offset_s      INTEGER,
@@ -177,6 +178,24 @@ def init_db() -> None:
     if rows:
         conn.commit()
 
+    # Migration: add user_seq to candle_alerts + backfill
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(candle_alerts)").fetchall()]
+    if "user_seq" not in cols:
+        conn.execute("ALTER TABLE candle_alerts ADD COLUMN user_seq INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    rows = conn.execute(
+        "SELECT id, chat_id FROM candle_alerts WHERE user_seq = 0 ORDER BY id"
+    ).fetchall()
+    counters3: dict[int, int] = defaultdict(int)
+    for row in rows:
+        counters3[row["chat_id"]] += 1
+        conn.execute(
+            "UPDATE candle_alerts SET user_seq = ? WHERE id = ?",
+            (counters3[row["chat_id"]], row["id"]),
+        )
+    if rows:
+        conn.commit()
+
 
 # ---- user helpers ----
 
@@ -225,9 +244,18 @@ def add_candle_alert(chat_id: int, symbol: Optional[str], timeframe_min: int, of
             raise ValueError(f"Timer-only M{timeframe_min} alert already exists")
 
     with _tx() as conn:
+        # Find smallest unused user_seq for this chat_id (reuse gaps)
+        rows = conn.execute(
+            "SELECT user_seq FROM candle_alerts WHERE chat_id = ? ORDER BY user_seq",
+            (chat_id,),
+        ).fetchall()
+        used = {r[0] for r in rows}
+        next_seq = 1
+        while next_seq in used:
+            next_seq += 1
         cur = conn.execute(
-            "INSERT INTO candle_alerts (chat_id, symbol, timeframe_min, offset_s) VALUES (?, ?, ?, ?)",
-            (chat_id, symbol, timeframe_min, offset_s),
+            "INSERT INTO candle_alerts (chat_id, user_seq, symbol, timeframe_min, offset_s) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, next_seq, symbol, timeframe_min, offset_s),
         )
         row = conn.execute("SELECT * FROM candle_alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _row_to_candle(row)
@@ -236,14 +264,23 @@ def add_candle_alert(chat_id: int, symbol: Optional[str], timeframe_min: int, of
 def get_candle_alerts(chat_id: Optional[int] = None) -> list[CandleAlert]:
     if chat_id is not None:
         rows = _conn().execute(
-            "SELECT * FROM candle_alerts WHERE chat_id=? AND enabled=1 ORDER BY id",
+            "SELECT * FROM candle_alerts WHERE chat_id=? AND enabled=1 ORDER BY user_seq",
             (chat_id,),
         ).fetchall()
     else:
         rows = _conn().execute(
-            "SELECT * FROM candle_alerts WHERE enabled=1 ORDER BY id"
+            "SELECT * FROM candle_alerts WHERE enabled=1 ORDER BY user_seq"
         ).fetchall()
     return [_row_to_candle(r) for r in rows]
+
+
+def get_candle_alert_by_user_seq(chat_id: int, user_seq: int) -> Optional[CandleAlert]:
+    """Look up a candle alert by per-user sequence number (cN from /list)."""
+    row = _conn().execute(
+        "SELECT * FROM candle_alerts WHERE chat_id=? AND user_seq=? AND enabled=1",
+        (chat_id, user_seq),
+    ).fetchone()
+    return _row_to_candle(row) if row else None
 
 
 def delete_candle_alert(alert_id: int) -> bool:
@@ -555,9 +592,11 @@ def _row_to_user(row: sqlite3.Row) -> User:
 
 
 def _row_to_candle(row: sqlite3.Row) -> CandleAlert:
+    keys = row.keys()
     return CandleAlert(
         id=row["id"],
         chat_id=row["chat_id"],
+        user_seq=row["user_seq"] if "user_seq" in keys else 0,
         symbol=row["symbol"],
         timeframe_min=row["timeframe_min"],
         offset_s=row["offset_s"],

@@ -498,15 +498,14 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # /del cN — delete candle alert by id (see /list for ids)
     c_match = re.match(r"^[cC](\d+)$", args[0])
     if c_match:
-        alert_id = int(c_match.group(1))
-        alerts = db.get_candle_alerts(chat_id)
-        target = next((a for a in alerts if a.id == alert_id), None)
+        user_seq = int(c_match.group(1))
+        target = db.get_candle_alert_by_user_seq(chat_id, user_seq)
         if target is None:
-            await update.message.reply_text(_err(f"Candle alert c{alert_id} not found"))
+            await update.message.reply_text(_err(f"Candle alert c{user_seq} not found"))
             return
-        db.delete_candle_alert(alert_id)
+        db.delete_candle_alert(target.id)
         scheduler.subscriptions_changed.set()
-        await update.message.reply_text(f"🗑️ Removed candle alert c{alert_id}")
+        await update.message.reply_text(f"🗑️ Removed candle alert c{user_seq}")
         return
 
     # Multi-arg with focus pair: /del 5 15 30
@@ -619,9 +618,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for a in candle_alerts:
             if a.symbol:
                 display = _display_symbol(a.symbol)
-                lines.append(f"  c{a.id} {display.upper()} {tf_label(a.timeframe_min)}")
+                lines.append(f"  c{a.user_seq} {display.upper()} {tf_label(a.timeframe_min)}")
             else:
-                lines.append(f"  c{a.id} Timer-only {tf_label(a.timeframe_min)}")
+                lines.append(f"  c{a.user_seq} Timer-only {tf_label(a.timeframe_min)}")
 
     if price_alerts:
         lines.append("")
