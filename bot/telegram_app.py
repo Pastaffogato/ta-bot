@@ -6,6 +6,7 @@ bot.formatting and bot.parsing respectively.  App wiring is in bot.app.
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -40,14 +41,20 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Per-user focus pair (session only, not persisted)
+# Per-user focus pair (session cache; persisted via user_prefs)
 # ============================================================
 
 _focus_pairs: dict[int, str] = {}
 
 
 def _get_focus(chat_id: int) -> Optional[str]:
-    return _focus_pairs.get(chat_id)
+    # Session cache first, then the persisted user pref.
+    if chat_id in _focus_pairs:
+        return _focus_pairs[chat_id]
+    try:
+        return db.get_user_prefs(chat_id).get("focus_pair") or None
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -73,6 +80,7 @@ async def cmd_focus_pair(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     arg = args[0].lower()
     if arg in ("off", "clear", "none"):
         _focus_pairs.pop(chat_id, None)
+        db.set_user_pref(chat_id, "focus_pair", "")
         await update.message.reply_text("✅ Focus cleared")
         return
 
@@ -89,6 +97,7 @@ async def cmd_focus_pair(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     _focus_pairs[chat_id] = resolved
+    db.set_user_pref(chat_id, "focus_pair", resolved)
     display = _display_symbol(resolved)
     await update.message.reply_text(
         f"🎯 Focus set to {display.upper()}\n"
@@ -98,62 +107,260 @@ async def cmd_focus_pair(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+_HELP_CHEAT_SHEET = (
+    "<b>ta-bot</b> — trading alert bot\n\n"
+    "<b>Focus pair:</b>\n"
+    "/fp XAUUSD — set · /fp off — clear · /fp — show\n\n"
+    "<b>Candle alerts:</b>\n"
+    "/add (a) [SYM] TF [TF...] — timer-only or OHLC alert\n"
+    "/del (d) — remove all · /del SYM TF · /del 5 · /del c3 (by id)\n"
+    "/list (l) — show active alerts (c{id}, p{id})\n"
+    "/offset (o) 8 — pre-close seconds\n\n"
+    "<b>OHLC / data:</b>\n"
+    "/now (n) [SYM] TF · /level (lv) SYM · /ind (ind) [SYM] TF\n"
+    "/indtf (itf) [SYM] IND [TF...] · /trend (tr) [SYM] TF [N]\n"
+    "/data (dt) on|off SECTION — toggle alert sections (ba, range, ind, …)\n\n"
+    "<b>Price alerts:</b>\n"
+    "/price (p) [SYM] 2400 [+50] [-30] [30m] [close]\n"
+    "/price (p) sma50 h1 above — indicator crossing\n"
+    "/cancel (c) [pID ...] — remove price alert(s); bare = all\n\n"
+    "<b>Marks:</b>\n"
+    "/mark (mk) [SYM] 2400 [30m] · /mark del [ID ...] · /mark list [SYM]\n"
+    "/mkd — mark del · /mkl — mark list\n\n"
+    "<b>Paper trade:</b>\n"
+    "/entry (e) [SYM] BUY|SELL [limit|stop PRICE] [+TP] [-SL]\n"
+    "/modify (m) t1 sl 2390 · /modify t1 tp 2420 · /modify t1 close\n\n"
+    "<b>Other:</b>\n"
+    "/signals (sig) [on|off] · /clear (clr) · /status (s) · /help (h)\n"
+    "/help <topic> — detailed help for one command, e.g. /help p\n\n"
+    "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
+    "<b>Expiry suffixes:</b> 30m, 2h, 45s\n"
+    "<b>Prefixless:</b> \"p bbm 1 3 5\" = /p bbm 1 3 5 · dot form: \".add 5\"\n"
+    "<b>Focus pair:</b> set /fp, then /a 5 = /a PAIR 5"
+)
+
+_HELP_TOPIC_ALIASES = {
+    "help": "help", "h": "help",
+    "fp": "fp", "focus": "fp",
+    "add": "add", "a": "add",
+    "del": "del", "d": "del",
+    "list": "list", "l": "list",
+    "offset": "offset", "o": "offset",
+    "now": "now", "n": "now",
+    "level": "level", "lv": "level",
+    "ind": "ind", "indicator": "ind",
+    "indtf": "indtf", "itf": "indtf",
+    "trend": "trend", "tr": "trend",
+    "price": "price", "p": "price",
+    "cancel": "cancel", "c": "cancel",
+    "mark": "mark", "mk": "mark", "mkd": "mark", "mkl": "mark",
+    "entry": "entry", "e": "entry",
+    "modify": "modify", "m": "modify",
+    "data": "data", "dt": "data",
+    "signals": "signals", "sig": "signals",
+    "clear": "clear", "clr": "clear",
+    "status": "status", "s": "status",
+}
+
+_HELP_SECTIONS: dict[str, str] = {
+    "fp": (
+        "<b>/fp — focus pair</b>\n"
+        "Sets the default symbol used by bare-argument commands.\n\n"
+        "Usage:\n"
+        "  /fp XAUUSD — set focus\n"
+        "  /fp off — clear focus\n"
+        "  /fp — show current focus\n\n"
+        "Then /add 5 = /add XAUUSD 5, /p 2400 = /p XAUUSD 2400,\n"
+        "/now 5, /ind 5, /trend 5, /entry buy ... all use the focus pair.\n"
+        "Focus persists across restarts."
+    ),
+    "add": (
+        "<b>/add — candle alerts</b>\n"
+        "Create candle alerts — timer-only (no OHLC) or with OHLC payload.\n\n"
+        "Usage:\n"
+        "  /add 5 — timer-only M5 alert\n"
+        "  /add 5 15 30 — several timer-only timeframes\n"
+        "  /add XAUUSD 5 — M5 alert with OHLC for XAUUSD\n"
+        "  /add XAUUSD 3 5 15 — symbol on multiple TFs\n\n"
+        "With focus set, /add 5 = /add PAIR 5.\n"
+        "Shorthand: /a."
+    ),
+    "del": (
+        "<b>/del — remove candle alerts</b>\n\n"
+        "Usage:\n"
+        "  /del — remove all candle alerts\n"
+        "  /del 5 — remove all M5 alerts\n"
+        "  /del 5 15 30 — remove several timeframes\n"
+        "  /del XAUUSD 5 — remove a specific symbol+TF\n"
+        "  /del c3 — remove candle alert by id (see /list)\n\n"
+        "Shorthand: /d."
+    ),
+    "list": (
+        "<b>/list — active alerts</b>\n"
+        "Shows all candle alerts (with c{id}) and price alerts (with p{id}).\n\n"
+        "Remove with /del cN (candle) or /cancel pN (price).\n"
+        "Shorthand: /l."
+    ),
+    "offset": (
+        "<b>/offset — pre-close offset</b>\n"
+        "Set how many seconds before the candle close the alert fires.\n\n"
+        "Usage: /offset SECONDS (0–60)\n"
+        "Example: /offset 8\n"
+        "Shorthand: /o."
+    ),
+    "now": (
+        "<b>/now — live OHLC</b>\n"
+        "Shows the current running candle's OHLC plus indicator snapshot.\n\n"
+        "Usage: /now [SYMBOL] TIMEFRAME\n"
+        "Example: /now xauusd 3\n"
+        "With focus set: /now 5. Bare /now with focus defaults to M5.\n"
+        "Shorthand: /n."
+    ),
+    "level": (
+        "<b>/level — key levels</b>\n"
+        "Shows yesterday's OHLC and today's open.\n\n"
+        "Usage: /level SYMBOL\n"
+        "Example: /level xauusd\n"
+        "With focus set: bare /level works.\n"
+        "Shorthand: /lv."
+    ),
+    "ind": (
+        "<b>/ind — indicator snapshot</b>\n"
+        "Shows the full indicator suite for a symbol/timeframe.\n\n"
+        "Usage: /ind [SYMBOL] TIMEFRAME\n"
+        "Example: /ind XAUUSD 5\n"
+        "Bare /ind uses focus + M5.\n"
+        "Shorthand: /ind."
+    ),
+    "indtf": (
+        "<b>/indtf — multi-timeframe indicator</b>\n"
+        "One indicator across M1/M3/M5/M15/M30/H1, or the TFs you list.\n\n"
+        "Usage: /indtf [SYMBOL] <indicator> [TF ...]\n"
+        "Indicators: bb (bands+%b+W+Wpct), sma50, ema20, rsi, adx,\n"
+        "tratr (TR/ATR), er, chop\n"
+        "Example: /indtf XAUUSD rsi 5 15\n"
+        "With focus: /indtf rsi 15\n"
+        "Shorthand: /itf."
+    ),
+    "trend": (
+        "<b>/trend — trend classification</b>\n\n"
+        "Usage: /trend [SYMBOL] [TIMEFRAME] [LOOKBACK]\n"
+        "Example: /trend xauusd 5 10\n"
+        "Bare /trend uses focus + M5 + 20 bars.\n"
+        "Shorthand: /tr."
+    ),
+    "price": (
+        "<b>/price — price alerts</b>\n"
+        "Crossing and close alerts, static price or indicator-based.\n\n"
+        "Usage:\n"
+        "  /price [SYMBOL] <price> [more prices] [+50] [-30] [30m|2h|45s] [close]\n"
+        "  /price 2400 2450 — multiple crossing alerts\n"
+        "  /price +50 -30 — relative pips from current price\n"
+        "  /price close 2400 2450 — close range (smart-sorted)\n"
+        "  /price sma50 h1 above — indicator crossing (TF required)\n"
+        "  /price bb_lower h4 — indicator, either direction\n"
+        "  /price bbl 3 5 — BB-lower on M3+M5 (bbu/bbm/bbl shorthand)\n\n"
+        "With focus: /price 2400 = /price PAIR 2400.\n"
+        "Shorthand: /p. Remove with /cancel pID."
+    ),
+    "cancel": (
+        "<b>/cancel — remove price alerts</b>\n\n"
+        "Usage:\n"
+        "  /cancel p3 — remove price alert p3\n"
+        "  /cancel 3 — same (bare number = p3)\n"
+        "  /cancel p1 p3 7 — multiple at once\n"
+        "  /cancel — remove ALL price alerts\n\n"
+        "Shorthand: /c."
+    ),
+    "mark": (
+        "<b>/mark — price marks</b>\n"
+        "Mark price levels that appear in candle alerts.\n\n"
+        "Usage:\n"
+        "  /mark [SYMBOL] <price> [price ...] [30m|2h|45s]\n"
+        "  /mark del — delete all marks\n"
+        "  /mark del 1 3 M5 — delete specific marks (M-prefix or bare)\n"
+        "  /mark list [SYMBOL] — list marks\n\n"
+        "With focus: /mark 2400.50 = /mark PAIR 2400.50.\n"
+        "Shorthands: /mk, /mkd (del), /mkl (list)."
+    ),
+    "entry": (
+        "<b>/entry — paper trades</b>\n\n"
+        "Usage:\n"
+        "  /entry — list open trades\n"
+        "  /entry XAUUSD buy +50 -30 — market buy, TP +50 pips, SL -30\n"
+        "  /entry XAUUSD sell limit 2410 +30 — sell limit at 2410\n"
+        "  /entry XAUUSD buy stop 2420 +20 — buy stop at 2420\n"
+        "  /entry XAUUSD buy tp sma50@h1 sl bb_lower@h4 — indicator TP/SL\n"
+        "  /entry buy tp 2420 sl 2390 — explicit prices (with focus)\n\n"
+        "Signs are position-relative: +N is always toward profit (TP side),\n"
+        "-N always toward the stop (SL side), for buy AND sell.\n"
+        "Shorthand: /e."
+    ),
+    "modify": (
+        "<b>/modify — paper trade adjustments</b>\n\n"
+        "Usage:\n"
+        "  /modify t1 sl 2390 — move stop loss\n"
+        "  /modify t1 tp 2420 — move take profit\n"
+        "  /modify t1 sl +30 tp -20 — relative pips\n"
+        "  /modify t1 close — close at market\n\n"
+        "Relative signs are position-relative (+N toward profit, -N toward stop).\n"
+        "Shorthand: /m."
+    ),
+    "data": (
+        "<b>/data — alert sections</b>\n"
+        "Toggle which sections appear in candle alerts.\n\n"
+        "Usage: /data on|off <section> [section ...]\n"
+        "  /data off ind — hide indicators\n"
+        "  /data off ba range — hide bid/ask + range body\n"
+        "  /data off all — hide everything\n\n"
+        "Sections & aliases:\n"
+        "  ba=show_bid_ask · range=show_range_body · prog=show_progression\n"
+        "  ind=show_indicators · pat=show_pattern · tr=show_trend\n"
+        "  marks=show_marks · ohlc=show_ohlc  (full names also accepted)\n\n"
+        "Bare /data shows the current state.\n"
+        "Shorthand: /dt."
+    ),
+    "signals": (
+        "<b>/signals — EA signal broadcast</b>\n"
+        "Opt in/out of EA signal broadcasts (default: on).\n\n"
+        "Usage: /signals on | /signals off | /signals (status)\n"
+        "Shorthand: /sig."
+    ),
+    "clear": (
+        "<b>/clear — reset everything</b>\n"
+        "Removes all candle alerts, price alerts, and marks for this chat.\n"
+        "Shorthand: /clr."
+    ),
+    "status": (
+        "<b>/status — bot health</b>\n"
+        "Shows MT5 connection, build, server, and active alert counts.\n"
+        "Shorthand: /s."
+    ),
+    "help": (
+        "<b>/help — help</b>\n"
+        "Bare /help shows the cheat sheet; /help <topic> shows one command.\n\n"
+        "Topics: fp, add, del, list, offset, now, level, ind, indtf, trend,\n"
+        "price, cancel, mark, entry, modify, data, signals, clear, status\n"
+        "(shorthands work too, e.g. /help p).\n"
+        "Shorthand: /h."
+    ),
+}
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "<b>ta-bot</b> — trading alert bot\n\n"
-        "<b>Session:</b>\n"
-        "/fp XAUUSD — set focus pair\n"
-        "/fp — show focus\n"
-        "/fp off — clear focus\n\n"
-        "<b>Candle alerts:</b>\n"
-        "/add 5 — timer-only M5 alert\n"
-        "/add XAUUSD 5 — M5 alert with OHLC\n"
-        "/del — remove all candle alerts\n"
-        "/del XAUUSD 5 — remove specific\n"
-        "/list — show active alerts\n"
-        "/offset 8 — pre-close seconds\n\n"
-        "<b>OHLC data:</b>\n"
-        "/now XAUUSD 3 — live M3 OHLC\n"
-        "/level XAUUSD — yesterday OHLC\n"
-        "/ind XAUUSD 5 — indicator snapshot\n"
-        "/indtf XAUUSD sma50 — one indicator on M1/M3/M5/M15/M30/H1\n"
-        "/indtf XAUUSD bb — BB bands, %b, width, Wpct per TF\n"
-        "/trend XAUUSD 5 — trend classification\n\n"
-        "<b>Price alerts:</b>\n"
-        "/price XAUUSD 2400 — cross alert\n"
-        "/price XAUUSD above 2400 — directional\n"
-        "/price sma50 h1 above — indicator crossing (TF required)\n"
-        "/price bb_lower h4 — indicator, either direction\n"
-        "/price bbl 3 5 — indicator on multiple TFs (bbu/bbm/bbl shorthand)\n"
-        "/cancel p7 — remove price alert\n"
-        "/cancel — cancel all price alerts\n\n"
-        "<b>Marks:</b>\n"
-        "/mark XAUUSD 2400 — add mark\n"
-        "/mark del — delete all marks\n"
-        "/mark del 1 — delete mark M1\n"
-        "/mark list — list marks\n"
-        "/mkd — shorthand for mark del\n"
-        "/mkl — shorthand for mark list\n\n"
-        "<b>Paper trade:</b>\n"
-        "/entry — list open trades\n"
-        "/entry XAUUSD buy +50 -30 — market buy, TP+50, SL-30\n"
-        "/entry XAUUSD sell limit 2410 +30 — sell limit\n"
-        "/entry XAUUSD buy stop 2420 +20 — buy stop\n"
-        "/entry XAUUSD buy tp sma50@h1 sl bb_lower@h4 — indicator TP/SL\n"
-        "/modify t1 sl 2390 — move stop loss\n"
-        "/modify t1 tp 2420 — move take profit\n"
-        "/modify t1 close — close at market\n\n"
-        "<b>Other:</b>\n"
-        "/data — toggle OHLC + indicator sections\n"
-        "/signals [on|off] — EA signal broadcast opt-in (bare = status)\n"
-        "/clear — clear all alerts + marks\n"
-        "/status — bot health\n"
-        "/help — this text\n\n"
-        "<b>Timeframes:</b> 3, 5, 15, m3, M5, h1, H4\n"
-        "<b>Shorthand:</b> /a, /d, /l, /o, /n, /lv, /p, /c, /s, /e, /m, /mk, /dt, /tr, /itf, /indtf\n"
-        "<b>Focus pair:</b> set /fp, then /a 5 = /a PAIR 5",
-        parse_mode=ParseMode.HTML,
-    )
+    args = context.args or []
+    topic = args[0].lower() if args else ""
+    if topic:
+        canonical = _HELP_TOPIC_ALIASES.get(topic)
+        if canonical is not None:
+            await update.message.reply_text(_HELP_SECTIONS[canonical], parse_mode=ParseMode.HTML)
+            return
+        await update.message.reply_text(
+            f"❌ Unknown topic: {topic}\n\n" + _HELP_CHEAT_SHEET,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await update.message.reply_text(_HELP_CHEAT_SHEET, parse_mode=ParseMode.HTML)
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -190,6 +397,28 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("\n".join(lines))
             return
 
+    # Multi-arg timer-only without focus pair: /add 5 15 30
+    if not focus and len(args) >= 2:
+        tfs = []
+        for a in args:
+            tf = parse_tf(a)
+            if tf is None:
+                tfs = None
+                break
+            tfs.append(tf)
+        if tfs:
+            lines = []
+            for tf in tfs:
+                try:
+                    db.add_candle_alert(chat_id, symbol=None, timeframe_min=tf)
+                    lines.append(f"✅ Timer-only {tf_label(tf)}")
+                except ValueError as e:
+                    lines.append(_err(str(e)))
+            scheduler.subscriptions_changed.set()
+            lines.append(f"Pre-close offset: {db.get_user(chat_id).default_offset_s}s")
+            await update.message.reply_text("\n".join(lines))
+            return
+
     if len(args) == 1:
         # /add TIMEFRAME — timer-only (no focus pair)
         tf = parse_tf(args[0])
@@ -210,6 +439,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # /add SYMBOL TIMEFRAME [TIMEFRAME ...]
     symbol = args[0].upper()
+    if parse_tf(args[0]) is not None and not focus:
+        await update.message.reply_text(_err(
+            f"'{args[0]}' is a timeframe — use /fp <SYMBOL> first, or include the symbol.\n"
+            f"Example: /add XAUUSD {args[0]}"
+        ))
+        return
     resolved = await mt5_data.resolve_symbol(symbol)
     if resolved is None:
         suggestions = await mt5_data.suggest_symbols(symbol)
@@ -259,6 +494,20 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     focus = _get_focus(chat_id)
 
+    # /del cN — delete candle alert by id (see /list for ids)
+    c_match = re.match(r"^[cC](\d+)$", args[0])
+    if c_match:
+        alert_id = int(c_match.group(1))
+        alerts = db.get_candle_alerts(chat_id)
+        target = next((a for a in alerts if a.id == alert_id), None)
+        if target is None:
+            await update.message.reply_text(_err(f"Candle alert c{alert_id} not found"))
+            return
+        db.delete_candle_alert(alert_id)
+        scheduler.subscriptions_changed.set()
+        await update.message.reply_text(f"🗑️ Removed candle alert c{alert_id}")
+        return
+
     # Multi-arg with focus pair: /del 5 15 30
     if focus and len(args) >= 1:
         tfs = []
@@ -281,6 +530,27 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(f"No {display.upper()} alerts to remove")
             return
 
+    # Multi-arg timer-only without focus pair: /del 5 15 30
+    if not focus and len(args) >= 2:
+        tfs = []
+        for a in args:
+            tf = parse_tf(a)
+            if tf is None:
+                tfs = None
+                break
+            tfs.append(tf)
+        if tfs:
+            total = 0
+            for tf in tfs:
+                n = db.delete_candle_alerts_by(chat_id, timeframe_min=tf)
+                total += n
+            if total > 0:
+                scheduler.subscriptions_changed.set()
+                await update.message.reply_text(f"🗑️ Removed {total} timer-only alert(s)")
+            else:
+                await update.message.reply_text("No timer-only alerts to remove")
+            return
+
     if len(args) == 1:
         # /del TIMEFRAME — remove timer-only alerts with that tf (no focus pair)
         tf = parse_tf(args[0])
@@ -297,6 +567,12 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # /del SYMBOL TIMEFRAME [TIMEFRAME ...]
     symbol = args[0].upper()
+    if parse_tf(args[0]) is not None and not focus:
+        await update.message.reply_text(_err(
+            f"'{args[0]}' is a timeframe — use /fp <SYMBOL> first, or include the symbol.\n"
+            f"Example: /del XAUUSD {args[0]}"
+        ))
+        return
     resolved = await mt5_data.resolve_symbol(symbol)
     if resolved is None:
         await update.message.reply_text(_err(f"Symbol '{symbol}' not found"))
@@ -342,9 +618,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for a in candle_alerts:
             if a.symbol:
                 display = _display_symbol(a.symbol)
-                lines.append(f"  {display.upper()} {tf_label(a.timeframe_min)}")
+                lines.append(f"  c{a.id} {display.upper()} {tf_label(a.timeframe_min)}")
             else:
-                lines.append(f"  Timer-only {tf_label(a.timeframe_min)}")
+                lines.append(f"  c{a.id} Timer-only {tf_label(a.timeframe_min)}")
 
     if price_alerts:
         lines.append("")
@@ -402,10 +678,10 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
 
     if not args:
-        # /now with no args: if fp is active, default to M1
+        # /now with no args: if fp is active, default to M5
         focus = _get_focus(chat_id)
         if focus:
-            args = ["1"]
+            args = ["5"]
         else:
             await update.message.reply_text(_err("Usage: /now [SYMBOL] TIMEFRAME\nExample: /now xauusd 3\nOr set focus with /fp first, then /now 5"))
             return
@@ -759,23 +1035,26 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"🗑️ Cancelled {n} price alert(s)" if n > 1 else "🗑️ Cancelled 1 price alert")
         return
 
-    raw = args[0].lower()
-    if raw.startswith("p"):
+    lines = []
+    for raw in args:
+        rid = raw.lower()
+        if rid.startswith("p"):
+            rid = rid[1:]
         try:
-            user_seq = int(raw[1:])
+            user_seq = int(rid)
         except ValueError:
-            await update.message.reply_text(_err(f"Invalid ID: {raw}"))
-            return
+            lines.append(_err(f"Invalid ID: {raw}"))
+            continue
 
         alert = db.get_price_alert_by_user_seq(chat_id, user_seq)
         if alert is None:
-            await update.message.reply_text(_err(f"Price alert p{user_seq} not found"))
-            return
+            lines.append(_err(f"Price alert p{user_seq} not found"))
+            continue
 
         db.update_price_alert(alert.id, enabled=False)
-        await update.message.reply_text(f"🗑️ Removed price alert p{user_seq}")
-    else:
-        await update.message.reply_text(_err("Use /cancel pID for price alerts\n/del for candle alerts"))
+        lines.append(f"🗑️ Removed price alert p{user_seq}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -820,18 +1099,6 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # bare command (or unknown arg) = status; no recipient count
         state = "off" if db.get_user_prefs(chat_id).get("ea_signals") == "off" else "on"
         await update.message.reply_text(f"signals: {state}")
-
-
-async def cmd_mark_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shorthand for /mark del [id]."""
-    context.args = ["del"] + (context.args or [])
-    await cmd_mark(update, context)
-
-
-async def cmd_mark_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shorthand for /mark list [symbol]."""
-    context.args = ["list"] + (context.args or [])
-    await cmd_mark(update, context)
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -957,7 +1224,7 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # Explicit tp/sl keyword: /entry buy tp sma50 sl bb_lower
             # or /entry buy tp 2420 sl 2390
             val = trade_args[i + 1]
-            resolved_price = await _resolve_tp_sl_value(val, resolved, entry_price, pip_size)
+            resolved_price = await _resolve_tp_sl_value(val, resolved, entry_price, pip_size, direction, a)
             if resolved_price is None:
                 hint = ""
                 from bot.indicators import INDICATOR_TARGETS
@@ -985,7 +1252,11 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     stop_loss = entry_price + pips * pip_size
             i += 1
         else:
-            i += 1  # skip unknown
+            await update.message.reply_text(_err(
+                f"Invalid argument: {trade_args[i]}\n"
+                f"Usage: /entry [SYMBOL] BUY|SELL [limit|stop PRICE] [+TP] [-SL]"
+            ))
+            return
 
     trade = db.add_paper_trade(chat_id, resolved, direction, order_type, entry_price, stop_loss, take_profit)
     display = _display_symbol(resolved)
@@ -1046,7 +1317,7 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         a = mod_args[i].lower()
         if a == "sl" and i + 1 < len(mod_args):
             sl_val = mod_args[i + 1]
-            new_sl = await _resolve_tp_sl_value(sl_val, trade.symbol, trade.entry_price, pip_size)
+            new_sl = await _resolve_tp_sl_value(sl_val, trade.symbol, trade.entry_price, pip_size, trade.direction, "sl")
             if new_sl is None:
                 await update.message.reply_text(_err(f"Invalid SL value: {sl_val}"))
                 i += 2
@@ -1057,7 +1328,7 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             i += 2
         elif a == "tp" and i + 1 < len(mod_args):
             tp_val = mod_args[i + 1]
-            new_tp = await _resolve_tp_sl_value(tp_val, trade.symbol, trade.entry_price, pip_size)
+            new_tp = await _resolve_tp_sl_value(tp_val, trade.symbol, trade.entry_price, pip_size, trade.direction, "tp")
             if new_tp is None:
                 await update.message.reply_text(_err(f"Invalid TP value: {tp_val}"))
                 i += 2
@@ -1079,7 +1350,11 @@ async def cmd_modify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             i += 1
         else:
-            i += 1  # skip unknown
+            await update.message.reply_text(_err(
+                f"Invalid argument: {mod_args[i]}\n"
+                f"Usage: /modify t1 sl <price> | tp <price> | close"
+            ))
+            return
 
 
 
@@ -1089,6 +1364,8 @@ async def _resolve_tp_sl_value(
     symbol: str,
     base_price: float,
     pip_size: float,
+    direction: str,
+    side: str,
 ) -> Optional[float]:
     """Resolve a TP/SL value to an absolute price.
 
@@ -1097,9 +1374,14 @@ async def _resolve_tp_sl_value(
         → resolved from the indicator snapshot on that timeframe's bars.
         Bare indicator names (e.g. "sma50" without @TF) are rejected so the
         user is never silently handed an M1-based level.
-      - Relative pips: "+20", "-10" → base_price ± pips
+      - Relative pips: "+20", "-10" → position-relative, always measured from
+        the entry toward profit (TP) or toward the stop (SL):
+        buy  → tp = base + N*pips,  sl = base - N*pips
+        sell → tp = base - N*pips,  sl = base + N*pips
+        (the +/- sign is ignored; the side determines the direction)
       - Absolute prices: "2420.50" → 2420.50
 
+    direction ∈ ("buy", "sell"), side ∈ ("tp", "sl").
     Returns None if the value cannot be resolved.
     """
     from bot.indicators import INDICATOR_TARGETS, resolve_indicator_target, compute_all
@@ -1128,7 +1410,23 @@ async def _resolve_tp_sl_value(
     if val_lower in INDICATOR_TARGETS:
         return None
 
-    return _resolve_relative_price(val, base_price, pip_size)
+    # Relative pips — position-relative (side determines the direction).
+    rel = _REL_RE.match(val)
+    if rel:
+        pips = float(rel.group(2))
+        offset = pips * pip_size
+        if direction == "buy":
+            # buy: TP above entry, SL below
+            return base_price + offset if side == "tp" else base_price - offset
+        else:
+            # sell: TP below entry, SL above
+            return base_price - offset if side == "tp" else base_price + offset
+
+    # Absolute price
+    try:
+        return float(val)
+    except ValueError:
+        return None
 
 
 async def _calc_unrealized(trade: "PaperTrade", chat_id: int) -> float:
@@ -1156,21 +1454,50 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "show_sma", "show_ema", "show_bb", "show_atr", "show_rsi", "show_adx",
         "show_er", "show_chop",
     }
+    ALIASES = {
+        "ba": "show_bid_ask",
+        "range": "show_range_body",
+        "prog": "show_progression",
+        "ind": "show_indicators",
+        "pat": "show_pattern",
+        "tr": "show_trend",
+        "marks": "show_marks",
+        "ohlc": "show_ohlc",
+    }
+    # alias -> full key, for displaying aliases on the bare listing
+    ALIAS_BY_KEY: dict[str, str] = {}
+    for alias, key in ALIASES.items():
+        ALIAS_BY_KEY.setdefault(key, alias)
+
+    def resolve_key(low: str) -> str:
+        return ALIASES.get(low, low)
 
     if not args:
         prefs = db.get_user_prefs(chat_id)
-        lines = [f"{k}: {prefs.get(k, 'on')}" for k in sorted(VALID_PREFS)]
+        lines = []
+        for k in sorted(VALID_PREFS):
+            alias = ALIAS_BY_KEY.get(k)
+            label = f"{k} ({alias})" if alias else k
+            lines.append(f"{label}: {prefs.get(k, 'on')}")
         await update.message.reply_text("\n".join(lines) or "all on (default)")
         return
 
     if args[0].lower() == "list":
         prefs = db.get_user_prefs(chat_id)
-        lines = [f"{k}: {prefs.get(k, 'on')}" for k in sorted(VALID_PREFS)]
+        lines = []
+        for k in sorted(VALID_PREFS):
+            alias = ALIAS_BY_KEY.get(k)
+            label = f"{k} ({alias})" if alias else k
+            lines.append(f"{label}: {prefs.get(k, 'on')}")
         await update.message.reply_text("\n".join(lines))
         return
 
     if len(args) < 2:
-        await update.message.reply_text(_err("Use: /data on|off <section> [section ...]\n  /data off show_bid_ask show_range"))
+        await update.message.reply_text(_err(
+            "Use: /data on|off <section> [section ...]\n"
+            "  /data off show_bid_ask show_range_body  or  /data off ba range\n"
+            "Aliases: ba, range, prog, ind, pat, tr, marks, ohlc; 'all' = every section"
+        ))
         return
 
     action = args[0].lower()
@@ -1178,7 +1505,22 @@ async def cmd_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(_err("Use: /data on|off <section> [section ...]"))
         return
 
-    keys = [a.lower() for a in args[1:]]
+    keys = []
+    for a in args[1:]:
+        low = a.lower()
+        if low == "all":
+            keys.extend(sorted(VALID_PREFS))
+        else:
+            keys.append(resolve_key(low))
+    # Dedupe while preserving order
+    seen = set()
+    deduped = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            deduped.append(k)
+    keys = deduped
+
     invalid = [k for k in keys if k not in VALID_PREFS]
     if invalid:
         await update.message.reply_text(
@@ -1208,7 +1550,8 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if args[0].lower() == "del":
-        if len(args) < 2:
+        ids = args[1:]
+        if not ids:
             # /mark del — delete all marks
             n = db.delete_all_marks(chat_id)
             if n > 0:
@@ -1216,15 +1559,21 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await update.message.reply_text("No marks to delete")
             return
-        try:
-            user_seq = int(args[1])
-        except ValueError:
-            await update.message.reply_text(_err(f"Invalid mark ID: {args[1]}"))
-            return
-        if db.delete_mark(chat_id, user_seq):
-            await update.message.reply_text(f"🗑️ Mark M{user_seq} deleted")
-        else:
-            await update.message.reply_text(_err(f"Mark M{user_seq} not found"))
+        lines = []
+        for raw in ids:
+            rid = raw.lower()
+            if rid.startswith("m"):
+                rid = rid[1:]
+            try:
+                user_seq = int(rid)
+            except ValueError:
+                lines.append(_err(f"Invalid mark ID: {raw}"))
+                continue
+            if db.delete_mark(chat_id, user_seq):
+                lines.append(f"🗑️ Mark M{user_seq} deleted")
+            else:
+                lines.append(_err(f"Mark M{user_seq} not found"))
+        await update.message.reply_text("\n".join(lines))
         return
 
     if args[0].lower() == "list":
@@ -1259,7 +1608,10 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         # Separate prices from expiry
-        prices, expiry_s, expiry_label = _parse_mark_args(args)
+        prices, expiry_s, expiry_label, ignored = _parse_mark_args(args)
+        if ignored:
+            await update.message.reply_text(_err("Invalid argument: " + ", ".join(ignored)))
+            return
         if not prices:
             await update.message.reply_text(_err("No valid price specified"))
             return
@@ -1286,7 +1638,10 @@ async def cmd_mark(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol = resolved
 
         # Separate prices from expiry in args[1:]
-        prices, expiry_s, expiry_label = _parse_mark_args(args[1:])
+        prices, expiry_s, expiry_label, ignored = _parse_mark_args(args[1:])
+        if ignored:
+            await update.message.reply_text(_err("Invalid argument: " + ", ".join(ignored)))
+            return
         if not prices:
             await update.message.reply_text(_err("No valid price specified"))
             return

@@ -184,18 +184,18 @@ Telegram bot that reads a local MetaTrader 5 terminal (read-only) to deliver:
 - Pattern is evaluated on the **incomplete** current bar — may shift before close. With `DEFAULT_OFFSET_S = 0` (the default) alerts fire at close and the pattern classifies the just-closed candle (final). Any offset > 0 makes it provisional: a forming candle can print BULL ENGULF then close red. Verified: a closed bearish candle (c < o) can never produce BULL ENGULF.
 
 ### `bot/app.py` — Application Builder
-- `build_app()` — creates PTB `Application`, registers all `CommandHandler`s (with short aliases: `/a`, `/d`, `/l`, `/p`, `/c`, `/s`, `/e`, `/m`, `/mk`, `/dt`, `/n`, `/lv`, `/o`, `/mkd`, `/mkl`).
+- `build_app()` — creates PTB `Application`, registers all `CommandHandler`s (with short aliases: `/a`, `/d`, `/l`, `/p`, `/c`, `/s`, `/e`, `/m`, `/mk`, `/dt`, `/n`, `/lv`, `/o`, `/mkd`, `/mkl`, `/h`, `/sig`, `/clr`, plus `/start` → help).
 - `_COMMANDS` dict: maps command name to handler function — used by dot-command dispatcher.
-- `_handle_dot_command()` — `MessageHandler` for `filters.Regex(r'^\.\w+')`. Strips leading dot, routes to same handler as slash command.
+- `_handle_text_command()` — `MessageHandler` for `filters.TEXT`. Routes dot-commands (`.add 5`) and prefixless plain-text commands in private chats (`p bbm 1 3 5`) to the same handlers as slash commands. Unknown dot-commands get a hint; all other text is silent.
 - `post_init` hook: starts `scheduler.scheduler_loop()` as a background asyncio task.
 - Scheduler callbacks: `_send_candle`, `_send_price`, `_send_error`, `_send_paper_trade` — all call `_app_ref.bot.send_message()`.
 
 ### `bot/telegram_app.py` — Command Handlers
 - **Command handlers**: `cmd_focus_pair`, `cmd_help`, `cmd_add`, `cmd_del`, `cmd_list`, `cmd_offset`, `cmd_now`, `cmd_level`, `cmd_price`, `cmd_cancel`, `cmd_status`, `cmd_data`, `cmd_mark`, `cmd_entry`, `cmd_modify`, `cmd_clear`, `cmd_indicator`, `cmd_indicator_tf`, `cmd_trend`, plus shorthand wrappers (`cmd_mark_del`, `cmd_mark_list`).
-- **Focus pair**: `_focus_pairs: dict[int, str]` — per-chat in-memory dict, session-only, not persisted. Resolved via `_get_focus(chat_id)`.
+- **Focus pair**: `_focus_pairs: dict[int, str]` — per-chat in-memory cache, persisted to `user_prefs` key `focus_pair` (survives restart). `_get_focus(chat_id)` checks cache then DB. Resolved via `_get_focus(chat_id)`.
 - **Multi-arg support**: `/add 5 15 30`, `/del 5 15 30`, `/price 2400 2450 2500`, `/mark 2400 2450 2500` — all work with focus pair.
 - **Indicator-based price alerts**: `/price sma50 above`, `/price bb_lower` — stores `indicator` field on PriceAlert, scheduler resolves dynamic target each cycle. Also supports expiry: `/price sma50 above 30m`.
-- **Paper trade**: `/entry` (list or create), `/modify` (sl/tp/close). Entry syntax: buy/sell, optional limit/stop, +N/-N for SL/TP, or `tp <indicator>` / `sl <indicator>` for indicator-based TP/SL (e.g. `/entry buy tp sma50 sl bb_lower`). Modify uses `sl`/`tp` keywords for absolute prices, relative pips, or indicator names. `_resolve_tp_sl_value()` async helper resolves indicator names to absolute prices via M1 snapshot.
+- **Paper trade**: `/entry` (list or create), `/modify` (sl/tp/close). Entry syntax: buy/sell, optional limit/stop, +N/-N for SL/TP, or `tp <indicator>` / `sl <indicator>` for indicator-based TP/SL (e.g. `/entry buy tp sma50 sl bb_lower`). Modify uses `sl`/`tp` keywords for absolute prices, relative pips, or indicator names. `_resolve_tp_sl_value()` async helper resolves indicator names to absolute prices via snapshot; **relative TP/SL signs are position-relative** — tp side (+N direction) is toward profit, sl side toward loss, for buy AND sell (sell-aware).
 - **Trend**: `/trend [SYMBOL] [TF] [LOOKBACK]` — classifies trend as UP/DOWN/SIDEWAYS using linear regression slope, with indicator context (ATR, RSI, ADX, price vs SMA50, BB zone).
 - **Shorthand wrappers**: `cmd_mark_del` delegates to `cmd_mark(["del", ...])`, `cmd_mark_list` delegates to `cmd_mark(["list", ...])`.
 
@@ -229,7 +229,7 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 
 8. **MT5 serialization** — All MT5 calls go through `_call_mt5()` with an asyncio.Lock, ensuring only one call is in flight at a time. This prevents MT5 API threading issues.
 
-9. **Dot-command support** — `.add xauusd 5` works same as `/add xauusd 5`. Implemented via MessageHandler + regex, not CommandHandler.
+9. **Prefixless command dispatch** — `.add xauusd 5`, `/add xauusd 5`, and plain-text `add xauusd 5` all work. The `filters.TEXT` MessageHandler dispatches when the first token (after optional `.` prefix) matches a registered command. Prefixless (no `.`/`/`) dispatch is **private-chat only** so group messages can't misfire; unknown dot-commands get a hint reply; all other text is silently ignored.
 
 10. **Inline migrations** — `init_db()` runs ALTER TABLE for columns added after initial schema. Uses PRAGMA table_info to detect missing columns.
 
@@ -240,6 +240,7 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 - **`time.time()` vs server time** — Never use MT5 bar/tick `.time` for scheduling. Always use `time.time()`.
 - **Thread-local DB connections** — Don't share a connection across threads. Use `db._conn()` which is thread-local.
 - **`subscriptions_changed` event** — Must be set after any add/delete/enable/disable of candle alerts. Not needed for price alerts (they poll every second anyway).
+- **Prefixless dispatch is private-chat only** — the `filters.TEXT` MessageHandler silently ignores non-command text and group-chat text, so group conversations can't trigger commands accidentally.
 - **`LATE_SEND_TOLERANCE_S = 3`** — If the scheduler wakes up >3s late, it skips the candle. Prevents stale alerts.
 - **`parse_tf` returns `None`** for unsupported timeframes — always check before using.
 - **`resolve_symbol` may return different case** than what was passed — MT5 returns exact symbol names from the broker.
@@ -252,27 +253,28 @@ paper_trades (id PK, chat_id FK→users, user_seq, symbol, direction, order_type
 
 | Command | Handler | Notes |
 |---------|---------|-------|
-| `/fp` | `cmd_focus_pair` | Session-only, in-memory dict |
-| `/help` | `cmd_help` | Static HTML message |
-| `/add`, `/a` | `cmd_add` | Multi-arg with focus |
-| `/del`, `/d` | `cmd_del` | Multi-arg with focus |
-| `/list`, `/l` | `cmd_list` | Shows candle + price alerts |
+| `/fp` | `cmd_focus_pair` | Persisted in user_prefs (survives restart), session cache in memory |
+| `/help`, `/h`, `/start` | `cmd_help` | Two-level: bare = cheat sheet, `/help <topic>` = per-command detail |
+| `/add`, `/a` | `cmd_add` | Multi-arg with focus; multi timer-only without focus (`/add 5 15 30`) |
+| `/del`, `/d` | `cmd_del` | Multi-arg with focus; `/del c3` deletes candle alert by id; multi timer-only |
+| `/list`, `/l` | `cmd_list` | Shows candle (c{id}) + price alerts |
 | `/offset`, `/o` | `cmd_offset` | Default offset_s per user |
-| `/now`, `/n` | `cmd_now` | Current running candle OHLC + indicators |
+| `/now`, `/n` | `cmd_now` | Defaults to M5 with focus |
 | `/level`, `/lv` | `cmd_level` | Yesterday OHLC + today open |
-| `/price`, `/p` | `cmd_price` | Multi-arg, close type, relative pips, expiry, indicator targets (sma50, bb_lower, etc.) |
-| `/cancel`, `/c` | `cmd_cancel` | Bare = cancel all, pID = specific |
+| `/price`, `/p` | `cmd_price` | Multi-arg, close type, relative pips, expiry, indicator targets (sma50, bb_lower, bbu/bbm/bbl shorthand) |
+| `/cancel`, `/c` | `cmd_cancel` | Bare = cancel all; multi-id with bare numbers or pN (`/cancel p1 3 7`) |
 | `/status`, `/s` | `cmd_status` | MT5 health + alert counts |
-| `/data`, `/dt` | `cmd_data` | Toggle sections: show_pattern/show_ohlc/show_indicators/show_progression/show_trend + granular indicator prefs |
-| `/mark`, `/mk` | `cmd_mark` | Multi-arg, expiry suffix, del/list subcommands |
+| `/data`, `/dt` | `cmd_data` | Toggle sections; aliases (ba/range/ind/pat/tr/marks/ohlc/prog); `all`; example cites show_range_body |
+| `/mark`, `/mk` | `cmd_mark` | Multi-arg, expiry suffix, del/list subcommands; del accepts bare/M-prefix multi-id |
 | `/mkd` | `cmd_mark_del` | Delegates to cmd_mark with "del" |
 | `/mkl` | `cmd_mark_list` | Delegates to cmd_mark with "list" |
-| `/entry`, `/e` | `cmd_entry` | List or create paper trades; supports indicator-based TP/SL |
-| `/modify`, `/m` | `cmd_modify` | sl/tp/close for paper trades; supports indicator names for sl/tp |
-| `/clear` | `cmd_clear` | Remove all alerts + marks |
+| `/entry`, `/e` | `cmd_entry` | List or create paper trades; indicator-based TP/SL; TP/SL signs are position-relative in all forms; unknown tokens error |
+| `/modify`, `/m` | `cmd_modify` | sl/tp/close; position-relative signs (sell-aware); indicator names; unknown tokens error |
+| `/clear`, `/clr` | `cmd_clear` | Remove all alerts + marks |
 | `/indicator`, `/ind` | `cmd_indicator` | On-demand indicator data (current running candle) |
 | `/indtf`, `/itf` | `cmd_indicator_tf` | One indicator across TFs (default M1/M3/M5/M15/M30/H1) |
 | `/trend`, `/tr` | `cmd_trend` | Trend classification with lookback + indicator context |
+| `/signals`, `/sig` | `cmd_signals` | EA signal broadcast opt-in (bare = status) |
 
 ## Development Workflow
 

@@ -56,14 +56,16 @@ def fmt_expiry(expires_at: str | None) -> str:
 
 # ── mark args ──
 
-def parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | None]:
-    """Separate prices and optional expiry suffix from mark args.
+def parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | None, list[str]]:
+    """Separate prices, optional expiry suffix, and ignored args from mark args.
 
-    Returns (prices, expiry_seconds, expiry_label).
+    Returns (prices, expiry_seconds, expiry_label, ignored) where ``ignored``
+    is the list of args that were neither a price nor an expiry suffix.
     """
     prices = []
     expiry_s = None
     expiry_label = None
+    ignored: list[str] = []
     for a in args:
         exp = parse_expiry(a)
         if exp is not None:
@@ -72,8 +74,8 @@ def parse_mark_args(args: list[str]) -> tuple[list[float], int | None, str | Non
             try:
                 prices.append(float(a))
             except ValueError:
-                pass  # skip non-price, non-expiry args
-    return prices, expiry_s, expiry_label
+                ignored.append(a)
+    return prices, expiry_s, expiry_label, ignored
 
 
 # ── price alert args ──

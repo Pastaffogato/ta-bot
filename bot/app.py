@@ -126,18 +126,44 @@ async def _send_paper_trade(
 # Dot-command dispatcher
 # ============================================================
 
-async def _handle_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle .command messages — strip dot, parse, dispatch to existing handlers."""
+async def _handle_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle dot-commands and prefixless plain-text commands in private chats.
+
+    - ".add xauusd 5" → dot path: dispatch to cmd_add; unknown dot command
+      gets a hint reply.
+    - "p bbm 1 3 5" → prefixless path (private chats only): dispatch to the
+      command whose name matches the first token.
+    - Anything else → silent return (never reply to non-command text, and
+      unknown slash commands like /foo must stay silent).
+    """
     text = update.message.text.strip()
-    if not text.startswith("."):
+    if not text:
         return
-    parts = text[1:].split()
+
+    if text.startswith("."):
+        # Dot path: strip the dot, parse, dispatch to existing handlers.
+        parts = text[1:].split()
+        if not parts:
+            return
+        cmd = parts[0].lower()
+        handler = _COMMANDS.get(cmd)
+        if handler is None:
+            await update.message.reply_text("❌ Unknown command — /help")
+            return
+        context.args = parts[1:]
+        await handler(update, context)
+        return
+
+    # Prefixless path: plain text acts as a command ONLY in private chats.
+    if update.effective_chat.type != "private":
+        return
+    parts = text.split()
     if not parts:
         return
     cmd = parts[0].lower()
     handler = _COMMANDS.get(cmd)
     if handler is None:
-        return  # silently ignore unknown dot commands
+        return  # silently ignore non-command plain text (incl. /foo)
     context.args = parts[1:]
     await handler(update, context)
 
@@ -163,7 +189,8 @@ def build_app() -> Application:
 
     # Register handlers
     handlers = [
-        ("help", cmd_help),
+        ("help", cmd_help), ("h", cmd_help),
+        ("start", cmd_help),
         ("focus_pair", cmd_focus_pair), ("fp", cmd_focus_pair),
         ("add", cmd_add), ("a", cmd_add),
         ("del", cmd_del), ("d", cmd_del),
@@ -177,23 +204,23 @@ def build_app() -> Application:
         ("data", cmd_data), ("dt", cmd_data),
         ("mark", cmd_mark), ("mk", cmd_mark),
         ("mkd", cmd_mark_del), ("mkl", cmd_mark_list),
-        ("clear", cmd_clear),
+        ("clear", cmd_clear), ("clr", cmd_clear),
         ("entry", cmd_entry), ("e", cmd_entry),
         ("modify", cmd_modify), ("m", cmd_modify),
         ("indicator", cmd_indicator), ("ind", cmd_indicator),
         ("indtf", cmd_indicator_tf), ("itf", cmd_indicator_tf),
         ("trend", cmd_trend), ("tr", cmd_trend),
-        ("signals", cmd_signals),
+        ("signals", cmd_signals), ("sig", cmd_signals),
     ]
 
     for name, func in handlers:
         app.add_handler(CommandHandler(name, func))
         _COMMANDS[name] = func
 
-    # Dot-prefix MessageHandler (e.g. ".add xauusd 5")
-    app.add_handler(MessageHandler(
-        filters.TEXT & filters.Regex(r'^\.\w+'), _handle_dot_command
-    ))
+    # Text MessageHandler (registered AFTER all CommandHandlers so slash
+    # commands are handled first): dot-commands (".add xauusd 5") and
+    # prefixless plain-text commands in private chats ("p bbm 1 3 5").
+    app.add_handler(MessageHandler(filters.TEXT, _handle_text_command))
 
     # Start scheduler + EA signal tail in background
     async def post_init(app: Application):
